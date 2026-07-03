@@ -1,0 +1,24 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+        // AUSBC 3.3.3 and its sibling modules (libnative, libuvc, libcommon,
+        // libpush ...) are hosted in the Liferay public Nexus mirror -- NOT on
+        // Maven Central, and only flakily on JitPack. This repo carries the
+        // complete, consistent set, which fixes "Could not find libnative-3.3.3".
+        maven { url 'https://repository.liferay.com/nexus/content/repositories/public/' }
+        // Fallback for anything the above doesn't have.
+        maven { url 'https://jitpack.io' }
+    }
+}
+
+rootProject.name = "ScannerBridge"
+include ':app'

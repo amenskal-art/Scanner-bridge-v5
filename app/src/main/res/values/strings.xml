@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Scanner Bridge</string>
+    <string name="title">SCANNER BRIDGE</string>
+    <string name="subtitle">USB-C Scanner \u2192 PC over Wi-Fi</string>
+    <string name="waiting_camera">Connect a USB-C scanner to begin</string>
+</resources>

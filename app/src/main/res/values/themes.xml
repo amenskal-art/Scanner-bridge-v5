@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ScannerBridge" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="android:statusBarColor">@color/bg_root</item>
+        <item name="android:navigationBarColor">@color/bg_root</item>
+        <item name="android:windowBackground">@color/bg_root</item>
+        <item name="colorPrimary">@color/accent_cyan</item>
+        <item name="colorOnPrimary">#04181C</item>
+        <item name="colorSurface">@color/bg_card</item>
+    </style>
+</resources>

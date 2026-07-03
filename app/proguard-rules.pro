@@ -1,0 +1,4 @@
+-keep class com.jiangdg.** { *; }
+-keep class com.serenegiant.** { *; }
+-dontwarn com.jiangdg.**
+-dontwarn com.serenegiant.**
