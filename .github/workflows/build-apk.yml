@@ -1,0 +1,62 @@
+name: Build APK
+
+# Builds the debug APK in the cloud. Runs on every push to main/master, and
+# can also be started by hand from the Actions tab (workflow_dispatch).
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Locate the Gradle project root
+        id: findroot
+        run: |
+          # Find the directory that actually contains settings.gradle, so the
+          # build works whether the project is at the repo root or nested in a
+          # subfolder (a common result of uploading an extracted zip folder).
+          DIR=$(dirname "$(find . -name settings.gradle -not -path '*/node_modules/*' | head -n 1)")
+          if [ -z "$DIR" ] || [ "$DIR" = "." ]; then
+            DIR="."
+          fi
+          echo "Project root detected at: $DIR"
+          echo "projectdir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Generate Gradle wrapper
+        working-directory: ${{ steps.findroot.outputs.projectdir }}
+        run: gradle wrapper --gradle-version 8.7
+
+      - name: Make gradlew executable
+        working-directory: ${{ steps.findroot.outputs.projectdir }}
+        run: chmod +x ./gradlew
+
+      - name: Build debug APK
+        working-directory: ${{ steps.findroot.outputs.projectdir }}
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScannerBridge-debug-apk
+          path: ${{ steps.findroot.outputs.projectdir }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
