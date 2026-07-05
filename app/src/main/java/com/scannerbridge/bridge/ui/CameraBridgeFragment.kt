@@ -198,18 +198,20 @@ class CameraBridgeFragment : CameraFragment() {
         }
     }
 
-    fun ctlSetExposure(percent: Int) {
-        safe { cam ->
-            val uvc = getUvcCamera(cam) ?: return@safe
-            try {
-                // 1) Force the camera into manual exposure mode (1 = Manual, 2 = Auto, 8 = Aperture Priority)
-                callUvcMethod(uvc, "setExposureMode", 1)
-
-                // 2) Pass the 0..100 percentage directly. saki's UVCCamera handles internal scaling automatically
-                callUvcMethod(uvc, "setExposure", percent.coerceIn(0, 100))
-            } catch (_: Throwable) {}
-        }
-    }
+    /**
+     * AUSBC 3.3.3's CameraUVC wrapper does not expose a real hardware exposure
+     * setter (the native UVCCamera exposure binding is private/unreachable),
+     * so Exposure is mapped to setGamma — the closest available UVC lever —
+     * same as CameraUVC.setBrightness/setContrast/etc. This mirrors the fix
+     * already described in CHANGES_ROUND3.md, which was never actually wired
+     * into this method (it was left calling nonexistent reflection method
+     * names, which silently did nothing).
+     *
+     * If a specific webcam doesn't implement the UVC gamma control in
+     * hardware, this slider may have little visible effect on that device —
+     * that's a hardware limitation, not a wiring bug.
+     */
+    fun ctlSetExposure(percent: Int) = safe { it.setGamma(percent.coerceIn(0, 100)) }
 
     fun ctlSetWbTemp(percent: Int) {
         safe { cam ->
