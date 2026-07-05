@@ -199,79 +199,15 @@ class CameraBridgeFragment : CameraFragment() {
     }
 
     fun ctlSetExposure(percent: Int) {
-        var applied = false
-        // 1) Try high-level percentage-based wrapper setters on CameraUVC directly
         safe { cam ->
+            val uvc = getUvcCamera(cam) ?: return@safe
             try {
-                for (methodName in listOf("setExposure", "setExposureVal", "setExposureLevel")) {
-                    try {
-                        val method = cam.javaClass.getMethods().firstOrNull { m ->
-                            m.name == methodName && m.parameterTypes.size == 1
-                        }
-                        if (method != null) {
-                            method.invoke(cam, percent.coerceIn(0, 100))
-                            applied = true
-                            break
-                        }
-                    } catch (_: Throwable) {}
-                }
+                // 1) Force the camera into manual exposure mode (1 = Manual, 2 = Auto, 8 = Aperture Priority)
+                callUvcMethod(uvc, "setExposureMode", 1)
+
+                // 2) Pass the 0..100 percentage directly. saki's UVCCamera handles internal scaling automatically
+                callUvcMethod(uvc, "setExposure", percent.coerceIn(0, 100))
             } catch (_: Throwable) {}
-        }
-        
-        // 2) If the wrapper has no native setter, fall back to low-level native JNI transfers
-        if (!applied) {
-            safe { cam ->
-                val uvc = getUvcCamera(cam) ?: return@safe
-                try {
-                    // Try disabling auto-exposure if supported (ignored if permanently manual)
-                    try {
-                        callUvcMethod(uvc, "setAutoExposure", false)
-                    } catch (_: Throwable) {}
-                    try {
-                        callUvcMethod(uvc, "setAutoExposure", 0)
-                    } catch (_: Throwable) {}
-                    try {
-                        callUvcMethod(uvc, "setExposureMode", 1)
-                    } catch (_: Throwable) {}
-                    
-                    // Query native hardware limits
-                    var minVal: Int? = null
-                    for (methodName in listOf("getExposureMin", "getExposureValMin", "getExposureMinVal")) {
-                        try {
-                            val res = callUvcMethod(uvc, methodName) as? Int
-                            if (res != null) {
-                                minVal = res
-                                break
-                            }
-                        } catch (_: Throwable) {}
-                    }
-                    
-                    var maxVal: Int? = null
-                    for (methodName in listOf("getExposureMax", "getExposureValMax", "getExposureMaxVal")) {
-                        try {
-                            val res = callUvcMethod(uvc, methodName) as? Int
-                            if (res != null) {
-                                maxVal = res
-                                break
-                            }
-                        } catch (_: Throwable) {}
-                    }
-                    
-                    val realMin = minVal ?: 1
-                    val realMax = maxVal ?: 10000
-                    
-                    if (realMax > realMin) {
-                        val scaled = realMin + (percent.coerceIn(0, 100) * (realMax - realMin) / 100)
-                        
-                        // Apply scaled value natively
-                        for (methodName in listOf("setExposureVal", "setExposure", "setExposureLevel")) {
-                            try {
-                                callUvcMethod(uvc, methodName, scaled)
-                            } catch (_: Throwable) {}
-                        }
-                    }
-                } catch (_: Throwable) {}
-            }
         }
     }
 
