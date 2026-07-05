@@ -270,45 +270,33 @@ class MainActivity : AppCompatActivity(),
         }, 1000)
     }
 
-    // ---------------- scanner controls ----------------
+    // ---------------- scanner controls (HandlerThread) ----------------
     @Volatile private var applyingRemote = false
 
     private val pendingControls = java.util.concurrent.ConcurrentHashMap<String, Int>()
-    private val controlExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
-    @Volatile private var controlWorkerScheduled = false
+    
+    // Dedicated background thread to run USB control JNI tasks safely
+    private val controlThread = android.os.HandlerThread("ScannerControlThread").apply { start() }
+    private val controlHandler = Handler(controlThread.looper)
 
-    private fun enqueueControl(name: String, value: Int) {
-        if (controlExecutor.isShutdown) return
-        pendingControls[name] = value
-        if (controlWorkerScheduled) return
-        controlWorkerScheduled = true
-        try {
-            controlExecutor.execute {
-                try {
-                    while (true) {
-                        if (pendingControls.isEmpty()) break
-                        val names = ArrayList(pendingControls.keys)
-                        for (n in names) {
-                            val v = pendingControls.remove(n) ?: continue
-                            try { applyControlToCamera(n, v) } catch (_: Throwable) {}
-                        }
-                        try { Thread.sleep(30) } catch (_: InterruptedException) { break }
-                    }
-                } finally {
-                    controlWorkerScheduled = false
-                    if (pendingControls.isNotEmpty()) {
-                        val any = pendingControls.entries.firstOrNull()
-                        if (any != null) enqueueControl(any.key, any.value)
-                    }
-                }
-            }
-        } catch (_: java.util.concurrent.RejectedExecutionException) {
-            controlWorkerScheduled = false
+    private val writePendingControlsRunnable = Runnable {
+        val names = ArrayList(pendingControls.keys)
+        for (n in names) {
+            val v = pendingControls.remove(n) ?: continue
+            try {
+                applyControlToCamera(n, v)
+            } catch (_: Throwable) {}
         }
     }
 
+    private fun enqueueControl(name: String, value: Int) {
+        pendingControls[name] = value
+        controlHandler.removeCallbacks(writePendingControlsRunnable)
+        // Debounce & throttle writes sequentially with a 30 ms delay
+        controlHandler.postDelayed(writePendingControlsRunnable, 30)
+    }
+
     private fun setupCameraControls() {
-        // Expand/collapse panel in portrait mode
         binding.controlsHeader.setOnClickListener {
             val body = binding.controlsBody
             val showing = body.visibility == View.VISIBLE
@@ -316,7 +304,7 @@ class MainActivity : AppCompatActivity(),
             binding.controlsToggle.text = if (showing) "Show" else "Hide"
         }
 
-        // Dual-Controls Synchronization Architecture (keeps normal and fullscreen UI perfectly matched)
+        // Dual-Controls Synchronization Architecture
         bindSeekBarPair(binding.sbBrightness, binding.fsSbBrightness, "brightness")
         bindSeekBarPair(binding.sbExposure,   binding.fsSbExposure,   "exposure")
         bindSeekBarPair(binding.sbContrast,   binding.fsSbContrast,   "contrast")
@@ -435,11 +423,7 @@ class MainActivity : AppCompatActivity(),
                             binding.sbWbTemp.progress = v
                             binding.fsSbWbTemp.progress = v
                         }
-                        "auto_wb"    -> {
-                            val active = (v >= 50)
-                            binding.cbAutoWb.isChecked = active
-                            binding.fsCbAutoWb.isChecked = active
-                        }
+                        "auto_wb"    -> binding.cbAutoWb.isChecked = (v >= 50)
                     }
                 }
             } finally {
@@ -632,7 +616,11 @@ class MainActivity : AppCompatActivity(),
 
     override fun onDestroy() {
         if (streaming || scanning) stopEverything()
-        try { controlExecutor.shutdownNow() } catch (_: Throwable) {}
+        try {
+            controlThread.quitSafely()
+        } catch (_: Throwable) {
+            try { controlThread.quit() } catch (_: Throwable) {}
+        }
         super.onDestroy()
     }
 }
