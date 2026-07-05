@@ -159,7 +159,6 @@ class CameraBridgeFragment : CameraFragment() {
     }
 
     private fun callUvcMethod(uvcCamera: Any, methodName: String, vararg args: Any?): Any? {
-        // Matched loosely by name and parameter count to bypass any boxing/unboxing type differences
         val method = uvcCamera.javaClass.getMethods().firstOrNull { m ->
             m.name == methodName && m.parameterTypes.size == args.size
         } ?: return null
@@ -191,7 +190,6 @@ class CameraBridgeFragment : CameraFragment() {
                     }
                 } catch (_: Throwable) {}
             }
-            // Fallback to the standard safe Wrapper if native reflection fails
             if (!applied) {
                 try {
                     cam.setZoom(percent.coerceIn(0, 100))
@@ -204,14 +202,48 @@ class CameraBridgeFragment : CameraFragment() {
         safe { cam ->
             val uvc = getUvcCamera(cam) ?: return@safe
             try {
-                // Set exposure mode to manual (typically 1)
-                callUvcMethod(uvc, "setExposureMode", 1)
+                // Try manual exposure modes (V4L2 manual = 1, JNI manual modes = 1)
+                try {
+                    callUvcMethod(uvc, "setExposureMode", 1)
+                } catch (_: Throwable) {
+                    try {
+                        callUvcMethod(uvc, "setExposureMode", 1.0)
+                    } catch (_: Throwable) {}
+                }
                 
-                val minVal = (callUvcMethod(uvc, "getExposureMin") as? Int) ?: 1
-                val maxVal = (callUvcMethod(uvc, "getExposureMax") as? Int) ?: 10000
+                // Probe all known exposure minimum variations
+                var minVal: Int? = null
+                for (methodName in listOf("getExposureMin", "getExposureValMin", "getExposureMinVal")) {
+                    val res = callUvcMethod(uvc, methodName) as? Int
+                    if (res != null) {
+                        minVal = res
+                        break
+                    }
+                }
                 
-                val scaled = minVal + (percent.coerceIn(0, 100) * (maxVal - minVal) / 100)
-                callUvcMethod(uvc, "setExposureVal", scaled)
+                // Probe all known exposure maximum variations
+                var maxVal: Int? = null
+                for (methodName in listOf("getExposureMax", "getExposureValMax", "getExposureMaxVal")) {
+                    val res = callUvcMethod(uvc, methodName) as? Int
+                    if (res != null) {
+                        maxVal = res
+                        break
+                    }
+                }
+                
+                val realMin = minVal ?: 1
+                val realMax = maxVal ?: 10000
+                
+                if (realMax > realMin) {
+                    val scaled = realMin + (percent.coerceIn(0, 100) * (realMax - realMin) / 100)
+                    
+                    // Probe and execute all known JNI exposure setters
+                    for (methodName in listOf("setExposureVal", "setExposure", "setExposureLevel")) {
+                        try {
+                            callUvcMethod(uvc, methodName, scaled)
+                        } catch (_: Throwable) {}
+                    }
+                }
             } catch (_: Throwable) {}
         }
     }
@@ -220,14 +252,43 @@ class CameraBridgeFragment : CameraFragment() {
         safe { cam ->
             val uvc = getUvcCamera(cam) ?: return@safe
             try {
-                // Set Auto WB to false so the manual value is respected
-                callUvcMethod(uvc, "setAutoWhiteBalance", false)
+                try {
+                    callUvcMethod(uvc, "setAutoWhiteBalance", false)
+                } catch (_: Throwable) {}
                 
-                val minVal = (callUvcMethod(uvc, "getWhiteBalanceMin") as? Int) ?: 2800
-                val maxVal = (callUvcMethod(uvc, "getWhiteBalanceMax") as? Int) ?: 6500
+                // Probe all known white balance minimum variations
+                var minVal: Int? = null
+                for (methodName in listOf("getWhiteBalanceMin", "getWhiteBalanceTempMin", "getWbTempMin")) {
+                    val res = callUvcMethod(uvc, methodName) as? Int
+                    if (res != null) {
+                        minVal = res
+                        break
+                    }
+                }
                 
-                val scaled = minVal + (percent.coerceIn(0, 100) * (maxVal - minVal) / 100)
-                callUvcMethod(uvc, "setWhiteBalance", scaled)
+                // Probe all known white balance maximum variations
+                var maxVal: Int? = null
+                for (methodName in listOf("getWhiteBalanceMax", "getWhiteBalanceTempMax", "getWbTempMax")) {
+                    val res = callUvcMethod(uvc, methodName) as? Int
+                    if (res != null) {
+                        maxVal = res
+                        break
+                    }
+                }
+                
+                val realMin = minVal ?: 2800
+                val realMax = maxVal ?: 6500
+                
+                if (realMax > realMin) {
+                    val scaled = realMin + (percent.coerceIn(0, 100) * (realMax - realMin) / 100)
+                    
+                    // Probe and execute all known JNI white balance setters
+                    for (methodName in listOf("setWhiteBalance", "setWhiteBalanceTemp", "setWbTemp")) {
+                        try {
+                            callUvcMethod(uvc, methodName, scaled)
+                        } catch (_: Throwable) {}
+                    }
+                }
             } catch (_: Throwable) {}
         }
     }
