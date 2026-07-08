@@ -209,16 +209,24 @@ class CameraBridgeFragment : CameraFragment() {
                 Log.w("CameraBridge", "  mUVCCamera field: NOT FOUND (reflection failed)")
             } else {
                 Log.d("CameraBridge", "  mUVCCamera class: ${uvc.javaClass.name}")
-                uvc.javaClass.methods
-                    .filter { it.name.contains("exposure", ignoreCase = true) }
-                    .distinctBy { it.name + it.parameterTypes.joinToString() }
-                    .sortedBy { it.name }
-                    .forEach {
-                        Log.d(
-                            "CameraBridge",
-                            "  mUVCCamera candidate: ${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }}) -> ${it.returnType.simpleName}"
-                        )
-                    }
+                // NOTE: use declaredMethods, not methods — the exposure API in
+                // this AUSBC build is PRIVATE native, invisible to .methods.
+                var c: Class<*>? = uvc.javaClass
+                while (c != null && c != Any::class.java) {
+                    c.declaredMethods
+                        .filter { it.name.contains("exposure", ignoreCase = true) }
+                        .sortedBy { it.name }
+                        .forEach {
+                            Log.d(
+                                "CameraBridge",
+                                "  mUVCCamera candidate [${c?.simpleName}]: ${it.name}(${it.parameterTypes.joinToString { p -> p.simpleName }}) -> ${it.returnType.simpleName}"
+                            )
+                        }
+                    c = c.superclass
+                }
+                val ptr = readDeclaredField(uvc, "mNativePtr")
+                val ctrl = readDeclaredField(uvc, "mControlSupports")
+                Log.d("CameraBridge", "  mNativePtr=$ptr mControlSupports=$ctrl (bit 0x02=AE mode, 0x08=exposure-abs)")
             }
             Log.d("CameraBridge", "===== EXPOSURE METHOD DUMP END =====")
         }
@@ -256,137 +264,125 @@ class CameraBridgeFragment : CameraFragment() {
         }
     }
 
+    // ---- Private reflection helpers ---------------------------------------
+    //
+    // WHY: In the AUSBC version this app compiles against, neither CameraUVC
+    // nor com.jiangdg.uvc.UVCCamera exposes ANY *public* exposure method.
+    // The exposure API only exists as PRIVATE native methods:
+    //     private static native int nativeSetExposureMode(long id, int mode)
+    //     private        native int nativeUpdateExposureLimit(long id)
+    //     private static native int nativeSetExposure(long id, int exposure)
+    // Probing with javaClass.methods (public-only) therefore finds nothing,
+    // which is exactly why the old ctlSetExposure logged "NO working method
+    // found". We call the natives directly using mNativePtr instead.
+
+    private fun findDeclaredMethod(
+        cls: Class<*>, name: String, vararg params: Class<*>
+    ): java.lang.reflect.Method? {
+        var c: Class<*>? = cls
+        while (c != null) {
+            try {
+                val m = c.getDeclaredMethod(name, *params)
+                m.isAccessible = true
+                return m
+            } catch (_: NoSuchMethodException) {
+            }
+            c = c.superclass
+        }
+        return null
+    }
+
+    private fun readDeclaredField(obj: Any, name: String): Any? {
+        var c: Class<*>? = obj.javaClass
+        while (c != null) {
+            try {
+                val f = c.getDeclaredField(name)
+                f.isAccessible = true
+                return f.get(obj)
+            } catch (_: NoSuchFieldException) {
+            }
+            c = c.superclass
+        }
+        return null
+    }
+
     /**
-     * Tries every plausible real exposure control across BOTH the CameraUVC
-     * wrapper and the raw mUVCCamera, logging every attempt, and stops at the
-     * first one that succeeds (invoke doesn't throw / method exists).
+     * Sets manual absolute exposure by invoking UVCCamera's private native
+     * methods directly (there is no public exposure API in this AUSBC build).
      *
-     * This deliberately does NOT assume any single method name is correct —
-     * previous attempts (guessed reflection names, then setGamma) both failed
-     * on this device, so we now probe broadly and log everything so the real
-     * answer comes from THIS device's logcat, not another guess.
+     * Sequence (matters!):
+     *  1. nativeSetExposureMode(ptr, 1)  -> UVC AE mode: 1=manual, 2=auto,
+     *     4=shutter priority, 8=aperture priority. Most webcams reject
+     *     exposure-time writes unless the mode is manual first.
+     *  2. nativeUpdateExposureLimit(ptr) -> fills mExposureMin/Max/Def.
+     *     (Known upstream bug: it checks the wrong support bitmask, so it can
+     *     fail on some cameras — we fall back to a sane 100µs-unit range.)
+     *  3. nativeSetExposure(ptr, absValue) -> uvc_set_exposure_abs.
+     *
+     * Native calls return 0 on success, negative libuvc error codes on failure.
      */
     fun ctlSetExposure(percent: Int) {
         val clamped = percent.coerceIn(0, 100)
-        var appliedVia: String? = null
-
         safe { cam ->
-            // ---- 1) Try direct wrapper methods on CameraUVC (percentage-style) ----
-            for (name in listOf(
-                "setExposure", "setExposureVal", "setExposureLevel",
-                "setExposureCompensation", "setExposureTime"
-            )) {
-                try {
-                    val m = cam.javaClass.methods.firstOrNull {
-                        it.name == name && it.parameterTypes.size == 1 &&
-                            (it.parameterTypes[0] == Int::class.java || it.parameterTypes[0] == Integer::class.java)
-                    }
-                    if (m != null) {
-                        m.invoke(cam, clamped)
-                        appliedVia = "CameraUVC.$name(percent)"
-                        Log.d("CameraBridge", "ctlSetExposure: applied via $appliedVia")
-                    }
-                } catch (e: Throwable) {
-                    Log.w("CameraBridge", "ctlSetExposure: CameraUVC.$name threw", e)
-                }
-            }
-
-            if (appliedVia != null) return@safe
-
-            // ---- 2) Fall back to the raw mUVCCamera, trying mode + value setters ----
             val uvc = getUvcCamera(cam)
             if (uvc == null) {
                 Log.w("CameraBridge", "ctlSetExposure: mUVCCamera not reachable via reflection")
                 return@safe
             }
 
-            // Put the device in manual exposure mode first if such a method exists.
-            // UVC bitmask: 1=manual, 2=auto, 4=shutter priority, 8=aperture priority.
-            // Some forks use plain booleans instead — try both shapes.
-            for (name in listOf("setExposureMode", "updateExposureMode")) {
-                try {
-                    val res = callUvcMethod(uvc, name, 1)
-                    if (res != null || uvc.javaClass.methods.any { it.name == name }) {
-                        Log.d("CameraBridge", "ctlSetExposure: $name(1) invoked (result=$res)")
-                    }
-                } catch (e: Throwable) {
-                    Log.w("CameraBridge", "ctlSetExposure: $name(1) threw", e)
-                }
-            }
-            for (name in listOf("setAutoExposure", "setExposureAuto")) {
-                try {
-                    val res = callUvcMethod(uvc, name, false)
-                    if (res != null || uvc.javaClass.methods.any { it.name == name }) {
-                        Log.d("CameraBridge", "ctlSetExposure: $name(false) invoked (result=$res)")
-                    }
-                } catch (e: Throwable) {
-                    Log.w("CameraBridge", "ctlSetExposure: $name(false) threw", e)
-                }
+            val ptr = (readDeclaredField(uvc, "mNativePtr") as? Long) ?: 0L
+            if (ptr == 0L) {
+                Log.w("CameraBridge", "ctlSetExposure: mNativePtr is 0 (camera not connected?)")
+                return@safe
             }
 
-            // Query real hardware min/max if exposed, else use a wide UVC-typical
-            // absolute-exposure-time range as a fallback (100us units).
-            var minVal: Int? = null
-            for (name in listOf("getExposureMin", "getExposureValMin", "getExposureMinVal", "getExposureAbsMin")) {
-                try {
-                    val res = callUvcMethod(uvc, name) as? Int
-                    if (res != null) {
-                        minVal = res
-                        Log.d("CameraBridge", "ctlSetExposure: $name() = $res")
-                        break
-                    }
-                } catch (e: Throwable) {
-                    Log.w("CameraBridge", "ctlSetExposure: $name() threw", e)
-                }
-            }
-            var maxVal: Int? = null
-            for (name in listOf("getExposureMax", "getExposureValMax", "getExposureMaxVal", "getExposureAbsMax")) {
-                try {
-                    val res = callUvcMethod(uvc, name) as? Int
-                    if (res != null) {
-                        maxVal = res
-                        Log.d("CameraBridge", "ctlSetExposure: $name() = $res")
-                        break
-                    }
-                } catch (e: Throwable) {
-                    Log.w("CameraBridge", "ctlSetExposure: $name() threw", e)
-                }
+            val cls = uvc.javaClass
+            val longT = Long::class.javaPrimitiveType!!
+            val intT = Int::class.javaPrimitiveType!!
+
+            // 1) Force manual AE mode.
+            val setMode = findDeclaredMethod(cls, "nativeSetExposureMode", longT, intT)
+            val modeRes = try {
+                setMode?.invoke(uvc, ptr, 1) as? Int
+            } catch (e: Throwable) {
+                Log.w("CameraBridge", "ctlSetExposure: nativeSetExposureMode threw", e)
+                null
             }
 
-            val realMin = minVal ?: 1
-            val realMax = maxVal ?: 10000
-            val scaled = if (realMax > realMin) {
-                realMin + (clamped * (realMax - realMin) / 100)
-            } else {
-                clamped
+            // 2) Query the camera's real exposure-time range.
+            try {
+                findDeclaredMethod(cls, "nativeUpdateExposureLimit", longT)?.invoke(uvc, ptr)
+            } catch (e: Throwable) {
+                Log.w("CameraBridge", "ctlSetExposure: nativeUpdateExposureLimit threw", e)
+            }
+            var minV = (readDeclaredField(uvc, "mExposureMin") as? Int) ?: 0
+            var maxV = (readDeclaredField(uvc, "mExposureMax") as? Int) ?: 0
+            if (maxV <= minV) {
+                // Fallback: UVC exposure-time-absolute is in 100 µs units.
+                // 1..5000 = 0.1 ms .. 0.5 s, safe on virtually every webcam.
+                minV = 1
+                maxV = 5000
+            }
+            val scaled = minV + clamped * (maxV - minV) / 100
+
+            // 3) Write absolute exposure.
+            val setExp = findDeclaredMethod(cls, "nativeSetExposure", longT, intT)
+            if (setExp == null) {
+                Log.e("CameraBridge", "ctlSetExposure: nativeSetExposure not found on ${cls.name}")
+                return@safe
+            }
+            val res = try {
+                setExp.invoke(uvc, ptr, scaled) as? Int
+            } catch (e: Throwable) {
+                Log.e("CameraBridge", "ctlSetExposure: nativeSetExposure threw", e)
+                null
             }
 
-            for (name in listOf(
-                "setExposureVal", "setExposure", "setExposureLevel",
-                "setExposureAbs", "setExposureTime", "setPropExposure"
-            )) {
-                try {
-                    val res = callUvcMethod(uvc, name, scaled)
-                    if (res != null) {
-                        appliedVia = "mUVCCamera.$name($scaled)"
-                        Log.d("CameraBridge", "ctlSetExposure: applied via $appliedVia")
-                    } else if (uvc.javaClass.methods.any { it.name == name }) {
-                        // method exists but returned null (e.g. void) — still counts as applied
-                        appliedVia = "mUVCCamera.$name($scaled) [void]"
-                        Log.d("CameraBridge", "ctlSetExposure: applied via $appliedVia")
-                    }
-                } catch (e: Throwable) {
-                    Log.w("CameraBridge", "ctlSetExposure: mUVCCamera.$name($scaled) threw", e)
-                }
-            }
-        }
-
-        if (appliedVia == null) {
-            Log.e(
+            Log.d(
                 "CameraBridge",
-                "ctlSetExposure($clamped): NO working method found on this device/AUSBC build. " +
-                    "Check the 'EXPOSURE METHOD DUMP' logged at camera-open time for the real API " +
-                    "surface, then hardcode that exact method name here."
+                "ctlSetExposure($clamped%): mode(1) result=$modeRes, " +
+                    "range=[$minV..$maxV], value=$scaled, set result=$res " +
+                    "(0=OK, negative=libuvc error)"
             )
         }
     }
