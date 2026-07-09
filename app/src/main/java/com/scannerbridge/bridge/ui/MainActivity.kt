@@ -304,7 +304,7 @@ class MainActivity : AppCompatActivity(),
                 try {
                     applyControlToCamera(n, v)
                     lastApplied[n] = v
-                    Thread.sleep(15) // pace EP0 writes; bursts wedge cheap firmware
+                    Thread.sleep(50) // pace EP0 writes; bursts wedge cheap firmware
                 } catch (_: Throwable) {
                 } finally {
                     controlBusySince = 0L
@@ -547,6 +547,11 @@ class MainActivity : AppCompatActivity(),
     }
 
     private fun applyInitialCameraControls() {
+        // Delay well past stream startup to allow Direct Uvc Controls to finish probing at 1200ms first.
+        ui.postDelayed({ applyInitialCameraControlsNow() }, 2000)
+    }
+
+    private fun applyInitialCameraControlsNow() {
         runOnUiThread {
             val values = linkedMapOf(
                 "auto_wb" to (if (binding.cbAutoWb.isChecked) 100 else 0),
