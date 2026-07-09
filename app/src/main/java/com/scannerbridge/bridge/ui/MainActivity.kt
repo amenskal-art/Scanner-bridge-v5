@@ -304,6 +304,7 @@ class MainActivity : AppCompatActivity(),
                 try {
                     applyControlToCamera(n, v)
                     lastApplied[n] = v
+                    Thread.sleep(15) // pace EP0 writes; bursts wedge cheap firmware
                 } catch (_: Throwable) {
                 } finally {
                     controlBusySince = 0L
@@ -342,7 +343,15 @@ class MainActivity : AppCompatActivity(),
         controlThread = android.os.HandlerThread("ScannerControlThread-r").apply { start() }
         controlHandler = Handler(controlThread.looper)
         pendingControls.clear()
+        lastApplied.clear()
 
+        // Order matters: closing the raw USB fd aborts the control transfer
+        // wedged inside libuvc (its timeout is infinite) and releases the
+        // UVCCamera monitor the wedged thread holds. Only AFTER that can
+        // closeCamera()/openCamera() actually run — calling them first just
+        // queued them behind the dead monitor forever, which is why the old
+        // recovery never brought controls back.
+        cameraFragment?.ctlAbortStuckControl()
         cameraFragment?.ctlRecoverCamera()
 
         // Allow another recovery attempt after things settle.
