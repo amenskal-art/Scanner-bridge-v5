@@ -104,6 +104,7 @@ class CameraBridgeFragment : CameraFragment() {
     ) {
         when (code) {
             ICameraStateCallBack.State.OPENED -> {
+                expInited = false
                 resolveActualPreviewSize()
                 frameBridge?.setResolution(frameW, frameH)
                 try {
@@ -119,9 +120,36 @@ class CameraBridgeFragment : CameraFragment() {
                 }
                 callbacks?.onCameraOpened(frameW, frameH)
             }
-            ICameraStateCallBack.State.CLOSED -> callbacks?.onCameraClosed()
-            ICameraStateCallBack.State.ERROR -> callbacks?.onCameraClosed()
+            ICameraStateCallBack.State.CLOSED -> {
+                expInited = false
+                callbacks?.onCameraClosed()
+            }
+            ICameraStateCallBack.State.ERROR -> {
+                expInited = false
+                callbacks?.onCameraClosed()
+            }
         }
+    }
+
+    /**
+     * Recovery for a wedged USB control endpoint: closing the device aborts
+     * any control transfer stuck in libusb (their timeout is infinite in this
+     * libuvc build), then we reopen after a short settle delay.
+     */
+    fun ctlRecoverCamera() {
+        expInited = false
+        try {
+            closeCamera()
+        } catch (t: Throwable) {
+            Log.w("CameraBridge", "ctlRecoverCamera: closeCamera threw", t)
+        }
+        view?.postDelayed({
+            try {
+                openCamera(getCameraView())
+            } catch (t: Throwable) {
+                Log.w("CameraBridge", "ctlRecoverCamera: openCamera threw", t)
+            }
+        }, 800)
     }
 
     private fun resolveActualPreviewSize() {
@@ -321,6 +349,13 @@ class CameraBridgeFragment : CameraFragment() {
      *
      * Native calls return 0 on success, negative libuvc error codes on failure.
      */
+    // Exposure init cache — mode + limits are written/queried ONCE per
+    // camera-open. Re-sending them on every slider tick multiplied USB
+    // control traffic ~6x and helped wedge cheap webcam firmware.
+    @Volatile private var expInited = false
+    @Volatile private var expMin = 1
+    @Volatile private var expMax = 5000
+
     fun ctlSetExposure(percent: Int) {
         val clamped = percent.coerceIn(0, 100)
         safe { cam ->
@@ -340,32 +375,38 @@ class CameraBridgeFragment : CameraFragment() {
             val longT = Long::class.javaPrimitiveType!!
             val intT = Int::class.javaPrimitiveType!!
 
-            // 1) Force manual AE mode.
-            val setMode = findDeclaredMethod(cls, "nativeSetExposureMode", longT, intT)
-            val modeRes = try {
-                setMode?.invoke(uvc, ptr, 1) as? Int
-            } catch (e: Throwable) {
-                Log.w("CameraBridge", "ctlSetExposure: nativeSetExposureMode threw", e)
-                null
+            if (!expInited) {
+                // 1) Force manual AE mode, once.
+                val setMode = findDeclaredMethod(cls, "nativeSetExposureMode", longT, intT)
+                val modeRes = try {
+                    setMode?.invoke(uvc, ptr, 1) as? Int
+                } catch (e: Throwable) {
+                    Log.w("CameraBridge", "ctlSetExposure: nativeSetExposureMode threw", e)
+                    null
+                }
+
+                // 2) Query the camera's real exposure-time range, once.
+                try {
+                    findDeclaredMethod(cls, "nativeUpdateExposureLimit", longT)?.invoke(uvc, ptr)
+                } catch (e: Throwable) {
+                    Log.w("CameraBridge", "ctlSetExposure: nativeUpdateExposureLimit threw", e)
+                }
+                var minV = (readDeclaredField(uvc, "mExposureMin") as? Int) ?: 0
+                var maxV = (readDeclaredField(uvc, "mExposureMax") as? Int) ?: 0
+                if (maxV <= minV) {
+                    // Fallback: UVC exposure-time-absolute is in 100 µs units.
+                    minV = 1
+                    maxV = 5000
+                }
+                expMin = minV
+                expMax = maxV
+                expInited = true
+                Log.d("CameraBridge", "ctlSetExposure init: mode(1)=$modeRes range=[$minV..$maxV]")
             }
 
-            // 2) Query the camera's real exposure-time range.
-            try {
-                findDeclaredMethod(cls, "nativeUpdateExposureLimit", longT)?.invoke(uvc, ptr)
-            } catch (e: Throwable) {
-                Log.w("CameraBridge", "ctlSetExposure: nativeUpdateExposureLimit threw", e)
-            }
-            var minV = (readDeclaredField(uvc, "mExposureMin") as? Int) ?: 0
-            var maxV = (readDeclaredField(uvc, "mExposureMax") as? Int) ?: 0
-            if (maxV <= minV) {
-                // Fallback: UVC exposure-time-absolute is in 100 µs units.
-                // 1..5000 = 0.1 ms .. 0.5 s, safe on virtually every webcam.
-                minV = 1
-                maxV = 5000
-            }
-            val scaled = minV + clamped * (maxV - minV) / 100
+            val scaled = expMin + clamped * (expMax - expMin) / 100
 
-            // 3) Write absolute exposure.
+            // 3) Write absolute exposure — single control transfer per tick.
             val setExp = findDeclaredMethod(cls, "nativeSetExposure", longT, intT)
             if (setExp == null) {
                 Log.e("CameraBridge", "ctlSetExposure: nativeSetExposure not found on ${cls.name}")
@@ -377,12 +418,9 @@ class CameraBridgeFragment : CameraFragment() {
                 Log.e("CameraBridge", "ctlSetExposure: nativeSetExposure threw", e)
                 null
             }
-
             Log.d(
                 "CameraBridge",
-                "ctlSetExposure($clamped%): mode(1) result=$modeRes, " +
-                    "range=[$minV..$maxV], value=$scaled, set result=$res " +
-                    "(0=OK, negative=libuvc error)"
+                "ctlSetExposure($clamped%): value=$scaled result=$res (0=OK, negative=libuvc error)"
             )
         }
     }
