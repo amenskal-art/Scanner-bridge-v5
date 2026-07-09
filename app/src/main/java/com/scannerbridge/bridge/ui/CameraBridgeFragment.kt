@@ -34,6 +34,10 @@ class CameraBridgeFragment : CameraFragment() {
     // UVCCamera monitor and freeze the app.
     @Volatile private var direct: UvcDirectControls? = null
 
+    // Raw USB connection AUSBC opened — kept so the watchdog can close() it
+    // to abort a control transfer wedged inside libuvc's infinite timeout.
+    @Volatile private var usbConn: android.hardware.usb.UsbDeviceConnection? = null
+
     private var binding: FragmentCameraBinding? = null
 
     private val reqWidth = 1920
@@ -112,7 +116,15 @@ class CameraBridgeFragment : CameraFragment() {
             ICameraStateCallBack.State.OPENED -> {
                 expInited = false
                 directFailStreak = 0
+                usbConn = UvcDirectControls.connectionFrom(getCurrentCamera())
+                // Trust the direct path ONLY if it actually answers on this
+                // hardware. On devices where it doesn't (they exist — the
+                // fallback was what applied controls all along), direct stays
+                // null and the libuvc path is used, protected by the watchdog.
                 direct = UvcDirectControls.from(getCurrentCamera())
+                    ?.takeIf { it.probe() }
+                Log.i("CameraBridge",
+                    "control path: ${if (direct != null) "DIRECT (timeout-safe)" else "LIBUVC (watchdog-protected)"}")
                 resolveActualPreviewSize()
                 frameBridge?.setResolution(frameW, frameH)
                 try {
@@ -131,11 +143,13 @@ class CameraBridgeFragment : CameraFragment() {
             ICameraStateCallBack.State.CLOSED -> {
                 expInited = false
                 direct = null
+                usbConn = null
                 callbacks?.onCameraClosed()
             }
             ICameraStateCallBack.State.ERROR -> {
                 expInited = false
                 direct = null
+                usbConn = null
                 callbacks?.onCameraClosed()
             }
         }
@@ -146,6 +160,23 @@ class CameraBridgeFragment : CameraFragment() {
      * any control transfer stuck in libusb (their timeout is infinite in this
      * libuvc build), then we reopen after a short settle delay.
      */
+    /**
+     * Nuclear unblock for a control transfer wedged inside libuvc (infinite
+     * timeout, holding the UVCCamera monitor). Closing the raw device fd is
+     * the ONLY thing that aborts that transfer — closeCamera() can't, because
+     * it needs the very monitor the wedged thread holds. After this, the
+     * monitor is released, close/reopen can actually run.
+     */
+    fun ctlAbortStuckControl() {
+        try {
+            usbConn?.close()
+            Log.w("CameraBridge", "ctlAbortStuckControl: raw USB connection closed to abort stuck transfer")
+        } catch (t: Throwable) {
+            Log.w("CameraBridge", "ctlAbortStuckControl failed", t)
+        }
+        usbConn = null
+    }
+
     fun ctlRecoverCamera() {
         expInited = false
         try {
@@ -298,7 +329,7 @@ class CameraBridgeFragment : CameraFragment() {
         }
         val streak = ++directFailStreak
         val now = System.currentTimeMillis()
-        if (streak >= 5 && now - lastAutoRecoverAt > 8000) {
+        if (streak >= 10 && now - lastAutoRecoverAt > 20000) {
             lastAutoRecoverAt = now
             directFailStreak = 0
             Log.w("CameraBridge", "direct control writes failing repeatedly — recovering camera")
