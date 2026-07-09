@@ -338,6 +338,7 @@ class MainActivity : AppCompatActivity(),
         recovering = true
         controlBusySince = 0L
         toast("Scanner controls stalled — resetting…")
+        onControlDiag("Control write stalled >4 s \u2014 forcing scanner reset", true)
 
         try { controlThread.quitSafely() } catch (_: Throwable) {}
         controlThread = android.os.HandlerThread("ScannerControlThread-r").apply { start() }
@@ -358,7 +359,58 @@ class MainActivity : AppCompatActivity(),
         ui.postDelayed({ recovering = false }, 5000)
     }
 
+    // ---------------- on-screen control diagnostics ----------------
+    // No Logcat needed: the latest control-path event is shown as a small
+    // status line at the top of Scanner Controls, errors also pop a toast
+    // (throttled), and TAPPING the status line copies the full diagnostic
+    // history to the clipboard so it can be pasted into a chat/bug report.
+    private var diagView: android.widget.TextView? = null
+    private val diagLog = ArrayDeque<String>()
+    private var lastDiagToastAt = 0L
+
+    private fun setupDiagView() {
+        val tv = android.widget.TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.parseColor("#9aa7b5"))
+            text = "Control path: waiting for scanner\u2026"
+            setPadding(0, 0, 0, (10 * resources.displayMetrics.density).toInt())
+            setOnClickListener {
+                if (diagLog.isEmpty()) return@setOnClickListener
+                val cb = getSystemService(Context.CLIPBOARD_SERVICE)
+                        as android.content.ClipboardManager
+                cb.setPrimaryClip(android.content.ClipData.newPlainText(
+                    "scanner-diag", diagLog.joinToString("\n")))
+                toast("Diagnostics copied \u2014 paste anywhere")
+            }
+        }
+        binding.controlsBody.addView(tv, 0)
+        diagView = tv
+    }
+
+    override fun onControlDiag(message: String, isError: Boolean) {
+        val ts = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+            .format(java.util.Date())
+        synchronized(diagLog) {
+            diagLog.addLast("[$ts] $message")
+            while (diagLog.size > 60) diagLog.removeFirst()
+        }
+        runOnUiThread {
+            diagView?.apply {
+                text = "$message  (tap to copy log)"
+                setTextColor(Color.parseColor(if (isError) "#ff7a7a" else "#9aa7b5"))
+            }
+            if (isError) {
+                val now = System.currentTimeMillis()
+                if (now - lastDiagToastAt > 5000) {
+                    lastDiagToastAt = now
+                    toast("Scanner: $message")
+                }
+            }
+        }
+    }
+
     private fun setupCameraControls() {
+        setupDiagView()
         binding.controlsHeader.setOnClickListener {
             val body = binding.controlsBody
             val showing = body.visibility == View.VISIBLE
