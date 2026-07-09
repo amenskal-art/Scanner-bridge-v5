@@ -265,6 +265,7 @@ class MainActivity : AppCompatActivity(),
             override fun run() {
                 val fps = frameBridge?.fpsCounter?.fps ?: 0
                 binding.fpsBadge.text = "$fps fps"
+                checkControlWatchdog()
                 ui.postDelayed(this, 1000)
             }
         }, 1000)
@@ -274,26 +275,78 @@ class MainActivity : AppCompatActivity(),
     @Volatile private var applyingRemote = false
 
     private val pendingControls = java.util.concurrent.ConcurrentHashMap<String, Int>()
-    
-    // Dedicated background thread to run USB control JNI tasks safely
-    private val controlThread = android.os.HandlerThread("ScannerControlThread").apply { start() }
-    private val controlHandler = Handler(controlThread.looper)
 
-    private val writePendingControlsRunnable = Runnable {
-        val names = ArrayList(pendingControls.keys)
-        for (n in names) {
-            val v = pendingControls.remove(n) ?: continue
-            try {
-                applyControlToCamera(n, v)
-            } catch (_: Throwable) {}
+    // Last value actually written to the camera per control. Skipping
+    // redundant writes keeps USB EP0 traffic to a minimum — flooding the
+    // control endpoint is what wedges cheap UVC firmware.
+    private val lastApplied = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    // Watchdog: timestamp set just before a JNI control write starts, cleared
+    // when it returns. libuvc in this build uses an INFINITE control-transfer
+    // timeout, so if the webcam ever stalls a request, the write never
+    // returns and this thread is wedged forever. The watchdog detects that
+    // and recovers (see checkControlWatchdog).
+    @Volatile private var controlBusySince = 0L
+    @Volatile private var recovering = false
+
+    // Dedicated background thread to run USB control JNI tasks safely.
+    // var (not val): the watchdog abandons a wedged thread and replaces it.
+    private var controlThread = android.os.HandlerThread("ScannerControlThread").apply { start() }
+    private var controlHandler = Handler(controlThread.looper)
+
+    private val writePendingControlsRunnable = object : Runnable {
+        override fun run() {
+            val names = ArrayList(pendingControls.keys)
+            for (n in names) {
+                val v = pendingControls.remove(n) ?: continue
+                if (lastApplied[n] == v) continue // no change -> no USB traffic
+                controlBusySince = System.currentTimeMillis()
+                try {
+                    applyControlToCamera(n, v)
+                    lastApplied[n] = v
+                } catch (_: Throwable) {
+                } finally {
+                    controlBusySince = 0L
+                }
+            }
         }
     }
 
     private fun enqueueControl(name: String, value: Int) {
         pendingControls[name] = value
         controlHandler.removeCallbacks(writePendingControlsRunnable)
-        // Debounce & throttle writes sequentially with a 30 ms delay
-        controlHandler.postDelayed(writePendingControlsRunnable, 30)
+        // Debounce & throttle writes sequentially. 100 ms (was 30) — during a
+        // slider drag only the newest value per control survives, cutting
+        // control-endpoint traffic to <=10 writes/sec per control.
+        controlHandler.postDelayed(writePendingControlsRunnable, 100)
+    }
+
+    /**
+     * Called once a second from the stats ticker. If a control write has been
+     * stuck inside JNI for >4 s, the webcam has stalled the USB control
+     * endpoint and that HandlerThread will never come back on its own.
+     * Recovery: abandon the wedged thread, spin up a fresh one, and
+     * close/reopen the camera — closing the device handle aborts the pending
+     * libusb transfer, which also lets the old thread finally exit.
+     */
+    private fun checkControlWatchdog() {
+        val since = controlBusySince
+        if (since == 0L || recovering) return
+        if (System.currentTimeMillis() - since < 4000) return
+
+        recovering = true
+        controlBusySince = 0L
+        toast("Scanner controls stalled — resetting…")
+
+        try { controlThread.quitSafely() } catch (_: Throwable) {}
+        controlThread = android.os.HandlerThread("ScannerControlThread-r").apply { start() }
+        controlHandler = Handler(controlThread.looper)
+        pendingControls.clear()
+
+        cameraFragment?.ctlRecoverCamera()
+
+        // Allow another recovery attempt after things settle.
+        ui.postDelayed({ recovering = false }, 5000)
     }
 
     private fun setupCameraControls() {
@@ -587,6 +640,7 @@ class MainActivity : AppCompatActivity(),
     // ---------------- camera callbacks ----------------
     override fun onCameraOpened(width: Int, height: Int) {
         cameraReady = true
+        lastApplied.clear() // fresh device state -> re-send everything
         if (frameBridge != null) {
             cameraFragment?.frameBridge = frameBridge
         }
