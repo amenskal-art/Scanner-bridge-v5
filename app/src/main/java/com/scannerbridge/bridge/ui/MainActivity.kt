@@ -328,6 +328,9 @@ class MainActivity : AppCompatActivity(),
      * Recovery: abandon the wedged thread, spin up a fresh one, and
      * close/reopen the camera — closing the device handle aborts the pending
      * libusb transfer, which also lets the old thread finally exit.
+     *
+     * FIX: The recovery now runs on a background thread, and we clear lastApplied
+     * so that after the camera reopens, all current slider values are re-sent.
      */
     private fun checkControlWatchdog() {
         val since = controlBusySince
@@ -338,15 +341,28 @@ class MainActivity : AppCompatActivity(),
         controlBusySince = 0L
         toast("Scanner controls stalled — resetting…")
 
-        try { controlThread.quitSafely() } catch (_: Throwable) {}
-        controlThread = android.os.HandlerThread("ScannerControlThread-r").apply { start() }
-        controlHandler = Handler(controlThread.looper)
-        pendingControls.clear()
+        // Run recovery on a background thread so UI does not freeze.
+        Thread {
+            try {
+                // 1. Quit the old thread
+                controlThread.quitSafely()
+            } catch (_: Throwable) {}
+            // 2. Create a fresh thread and handler
+            controlThread = android.os.HandlerThread("ScannerControlThread-r").apply { start() }
+            controlHandler = Handler(controlThread.looper)
+            // 3. Clear pending and lastApplied to force re-apply after reopen
+            pendingControls.clear()
+            lastApplied.clear()
 
-        cameraFragment?.ctlRecoverCamera()
-
-        // Allow another recovery attempt after things settle.
-        ui.postDelayed({ recovering = false }, 5000)
+            // 4. Recover the camera on the UI thread (needed for fragment ops)
+            runOnUiThread {
+                cameraFragment?.ctlRecoverCamera()
+                // 5. After the camera reopens (onCameraOpened will be called),
+                //    applyInitialCameraControls() will re-send all current values.
+                //    We also need to allow further recovery attempts.
+                ui.postDelayed({ recovering = false }, 5000)
+            }
+        }.start()
     }
 
     private fun setupCameraControls() {
@@ -640,7 +656,9 @@ class MainActivity : AppCompatActivity(),
     // ---------------- camera callbacks ----------------
     override fun onCameraOpened(width: Int, height: Int) {
         cameraReady = true
-        lastApplied.clear() // fresh device state -> re-send everything
+        // When the camera reopens, we must clear lastApplied to force re-send
+        // all current controls (the camera may have forgotten them after reset).
+        lastApplied.clear()
         if (frameBridge != null) {
             cameraFragment?.frameBridge = frameBridge
         }
