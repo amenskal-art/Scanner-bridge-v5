@@ -28,6 +28,12 @@ class CameraBridgeFragment : CameraFragment() {
     var callbacks: Callbacks? = null
     @Volatile var frameBridge: FrameBridge? = null
 
+    // Direct UVC control path (Android controlTransfer with real timeouts).
+    // ALL controls go through this; libuvc's synchronized control methods are
+    // never called after open, so a camera stall can no longer deadlock the
+    // UVCCamera monitor and freeze the app.
+    @Volatile private var direct: UvcDirectControls? = null
+
     private var binding: FragmentCameraBinding? = null
 
     private val reqWidth = 1920
@@ -105,6 +111,7 @@ class CameraBridgeFragment : CameraFragment() {
         when (code) {
             ICameraStateCallBack.State.OPENED -> {
                 expInited = false
+                direct = UvcDirectControls.from(getCurrentCamera())
                 resolveActualPreviewSize()
                 frameBridge?.setResolution(frameW, frameH)
                 try {
@@ -122,10 +129,12 @@ class CameraBridgeFragment : CameraFragment() {
             }
             ICameraStateCallBack.State.CLOSED -> {
                 expInited = false
+                direct = null
                 callbacks?.onCameraClosed()
             }
             ICameraStateCallBack.State.ERROR -> {
                 expInited = false
+                direct = null
                 callbacks?.onCameraClosed()
             }
         }
@@ -261,15 +270,41 @@ class CameraBridgeFragment : CameraFragment() {
     }
 
     // ---- Scanner controls (UVC) ------------------------------------------
+    // All controls prefer the direct timeout-safe path. The old CameraUVC /
+    // reflection paths remain ONLY as fallback when direct init failed.
 
-    fun ctlSetBrightness(percent: Int) = safe { it.setBrightness(percent.coerceIn(0, 100)) }
-    fun ctlSetContrast(percent: Int) = safe { it.setContrast(percent.coerceIn(0, 100)) }
-    fun ctlSetGain(percent: Int) = safe { it.setGain(percent.coerceIn(0, 100)) }
-    fun ctlSetSharpness(percent: Int) = safe { it.setSharpness(percent.coerceIn(0, 100)) }
-    fun ctlSetSaturation(percent: Int) = safe { it.setSaturation(percent.coerceIn(0, 100)) }
-    fun ctlSetAutoWhiteBalance(on: Boolean) = safe { it.setAutoWhiteBalance(on) }
+    fun ctlSetBrightness(percent: Int) {
+        if (direct?.setPu(UvcDirectControls.PU_BRIGHTNESS, percent) == true) return
+        safe { it.setBrightness(percent.coerceIn(0, 100)) }
+    }
+
+    fun ctlSetContrast(percent: Int) {
+        if (direct?.setPu(UvcDirectControls.PU_CONTRAST, percent) == true) return
+        safe { it.setContrast(percent.coerceIn(0, 100)) }
+    }
+
+    fun ctlSetGain(percent: Int) {
+        if (direct?.setPu(UvcDirectControls.PU_GAIN, percent) == true) return
+        safe { it.setGain(percent.coerceIn(0, 100)) }
+    }
+
+    fun ctlSetSharpness(percent: Int) {
+        if (direct?.setPu(UvcDirectControls.PU_SHARPNESS, percent) == true) return
+        safe { it.setSharpness(percent.coerceIn(0, 100)) }
+    }
+
+    fun ctlSetSaturation(percent: Int) {
+        if (direct?.setPu(UvcDirectControls.PU_SATURATION, percent) == true) return
+        safe { it.setSaturation(percent.coerceIn(0, 100)) }
+    }
+
+    fun ctlSetAutoWhiteBalance(on: Boolean) {
+        if (direct?.setAutoWhiteBalance(on) == true) return
+        safe { it.setAutoWhiteBalance(on) }
+    }
 
     fun ctlSetZoom(percent: Int) {
+        if (direct?.setZoomPercent(percent) == true) return
         var applied = false
         safe { cam ->
             val uvc = getUvcCamera(cam)
@@ -357,6 +392,7 @@ class CameraBridgeFragment : CameraFragment() {
     @Volatile private var expMax = 5000
 
     fun ctlSetExposure(percent: Int) {
+        if (direct?.setExposurePercent(percent) == true) return
         val clamped = percent.coerceIn(0, 100)
         safe { cam ->
             val uvc = getUvcCamera(cam)
@@ -426,6 +462,7 @@ class CameraBridgeFragment : CameraFragment() {
     }
 
     fun ctlSetWbTemp(percent: Int) {
+        if (direct?.setWbTempPercent(percent) == true) return
         safe { cam ->
             val uvc = getUvcCamera(cam) ?: return@safe
             try {
