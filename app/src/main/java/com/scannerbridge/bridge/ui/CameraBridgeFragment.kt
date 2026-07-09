@@ -23,6 +23,19 @@ class CameraBridgeFragment : CameraFragment() {
     interface Callbacks {
         fun onCameraOpened(width: Int, height: Int)
         fun onCameraClosed()
+        /** Human-readable control diagnostics for the on-screen status line. */
+        fun onControlDiag(message: String, isError: Boolean) {}
+    }
+
+    // Throttle diag spam: at most one error message per 2 s reaches the UI.
+    @Volatile private var lastDiagErrAt = 0L
+    private fun diag(msg: String, err: Boolean = false) {
+        if (err) {
+            val now = System.currentTimeMillis()
+            if (now - lastDiagErrAt < 2000) return
+            lastDiagErrAt = now
+        }
+        try { callbacks?.onControlDiag(msg, err) } catch (_: Throwable) {}
     }
 
     var callbacks: Callbacks? = null
@@ -122,9 +135,14 @@ class CameraBridgeFragment : CameraFragment() {
                 // fallback was what applied controls all along), direct stays
                 // null and the libuvc path is used, protected by the watchdog.
                 direct = UvcDirectControls.from(getCurrentCamera())
+                    ?.also { it.diagSink = { m -> diag(m, true) } }
                     ?.takeIf { it.probe() }
                 Log.i("CameraBridge",
                     "control path: ${if (direct != null) "DIRECT (timeout-safe)" else "LIBUVC (watchdog-protected)"}")
+                diag(if (direct != null)
+                    "Control path: DIRECT \u2713 (timeout-safe)"
+                else
+                    "Control path: LIBUVC fallback (direct probe failed)")
                 resolveActualPreviewSize()
                 frameBridge?.setResolution(frameW, frameH)
                 try {
@@ -171,6 +189,7 @@ class CameraBridgeFragment : CameraFragment() {
         try {
             usbConn?.close()
             Log.w("CameraBridge", "ctlAbortStuckControl: raw USB connection closed to abort stuck transfer")
+            diag("Stuck USB control aborted \u2014 restarting scanner\u2026", true)
         } catch (t: Throwable) {
             Log.w("CameraBridge", "ctlAbortStuckControl failed", t)
         }
@@ -333,6 +352,7 @@ class CameraBridgeFragment : CameraFragment() {
             lastAutoRecoverAt = now
             directFailStreak = 0
             Log.w("CameraBridge", "direct control writes failing repeatedly — recovering camera")
+            diag("Controls failing repeatedly \u2014 restarting scanner\u2026", true)
             view?.post { ctlRecoverCamera() }
         }
     }
