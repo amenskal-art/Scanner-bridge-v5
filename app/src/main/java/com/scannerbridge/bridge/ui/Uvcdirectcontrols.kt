@@ -147,23 +147,38 @@ class UvcDirectControls private constructor(
     private val ranges = java.util.concurrent.ConcurrentHashMap<Int, Pair<Int, Int>>()
     @Volatile private var aeManualSet = false
 
+    // Tracks whether we already forced auto-WB off, so a wb_temp slider drag
+    // sends ONE transfer per tick instead of two. Cheap UVC firmware wedges
+    // its control endpoint when EP0 is flooded while streaming; halving the
+    // traffic on the hottest control matters.
+    @Volatile private var wbAutoOffSent = false
+
+    // All EP0 control transfers are serialized. Two overlapping control
+    // transfers on the same device fd (e.g. old + replacement control thread
+    // during a recovery) is a classic way to stall cheap webcam firmware.
+    private val transferLock = Any()
+
     // ---- raw transfer helpers ---------------------------------------------
 
     private fun setCur(entity: Int, cs: Int, value: Int, size: Int): Boolean {
         val buf = ByteArray(size)
         for (b in 0 until size) buf[b] = ((value shr (8 * b)) and 0xFF).toByte()
-        val r = conn.controlTransfer(
-            REQ_SET, SET_CUR, cs shl 8, (entity shl 8) or vcInterface, buf, size, TIMEOUT_MS
-        )
+        val r = synchronized(transferLock) {
+            conn.controlTransfer(
+                REQ_SET, SET_CUR, cs shl 8, (entity shl 8) or vcInterface, buf, size, TIMEOUT_MS
+            )
+        }
         if (r < 0) Log.w(TAG, "SET_CUR entity=$entity cs=0x${cs.toString(16)} val=$value FAILED ($r)")
         return r >= 0
     }
 
     private fun getReq(req: Int, entity: Int, cs: Int, size: Int): Int? {
         val buf = ByteArray(size)
-        val r = conn.controlTransfer(
-            REQ_GET, req, cs shl 8, (entity shl 8) or vcInterface, buf, size, TIMEOUT_MS
-        )
+        val r = synchronized(transferLock) {
+            conn.controlTransfer(
+                REQ_GET, req, cs shl 8, (entity shl 8) or vcInterface, buf, size, TIMEOUT_MS
+            )
+        }
         if (r < 0) return null
         var v = 0
         for (b in 0 until size) v = v or ((buf[b].toInt() and 0xFF) shl (8 * b))
@@ -198,13 +213,18 @@ class UvcDirectControls private constructor(
 
     fun setAutoWhiteBalance(on: Boolean): Boolean {
         if (processingUnitId < 0) return false
-        return setCur(processingUnitId, PU_WB_TEMP_AUTO, if (on) 1 else 0, 1)
+        val ok = setCur(processingUnitId, PU_WB_TEMP_AUTO, if (on) 1 else 0, 1)
+        if (ok) wbAutoOffSent = !on
+        return ok
     }
 
     fun setWbTempPercent(percent: Int): Boolean {
         if (processingUnitId < 0) return false
-        // manual temp requires auto-WB off; cheap to send, 1-byte transfer
-        setCur(processingUnitId, PU_WB_TEMP_AUTO, 0, 1)
+        // Manual temp requires auto-WB off — but send that byte only once,
+        // not on every slider tick.
+        if (!wbAutoOffSent) {
+            if (setCur(processingUnitId, PU_WB_TEMP_AUTO, 0, 1)) wbAutoOffSent = true
+        }
         val range = rangeOf(processingUnitId, PU_WB_TEMP, 2, 2800, 6500)
         return setCur(processingUnitId, PU_WB_TEMP, scale(percent, range), 2)
     }
