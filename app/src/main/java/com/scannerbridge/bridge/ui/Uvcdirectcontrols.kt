@@ -164,6 +164,9 @@ class UvcDirectControls private constructor(
         }
     }
 
+    /** Optional sink for human-readable error messages (shown in the app UI). */
+    @Volatile var diagSink: ((String) -> Unit)? = null
+
     // Cached (min, max) per (entity, selector); queried once with timeout.
     private val ranges = java.util.concurrent.ConcurrentHashMap<Int, Pair<Int, Int>>()
     @Volatile private var aeManualSet = false
@@ -189,7 +192,10 @@ class UvcDirectControls private constructor(
                 REQ_SET, SET_CUR, cs shl 8, (entity shl 8) or vcInterface, buf, size, TIMEOUT_MS
             )
         }
-        if (r < 0) Log.w(TAG, "SET_CUR entity=$entity cs=0x${cs.toString(16)} val=$value FAILED ($r)")
+        if (r < 0) {
+            Log.w(TAG, "SET_CUR entity=$entity cs=0x${cs.toString(16)} val=$value FAILED ($r)")
+            diagSink?.invoke("USB write failed: cs=0x${cs.toString(16)} r=$r")
+        }
         return r >= 0
     }
 
@@ -239,6 +245,7 @@ class UvcDirectControls private constructor(
         Thread.sleep(150)
         val ok = getReq(GET_CUR, processingUnitId, PU_BRIGHTNESS, 2) != null
         Log.i(TAG, "probe: direct control path ${if (ok) "OK" else "NOT available on this device"}")
+        if (!ok) diagSink?.invoke("Direct USB path not answering (probe failed)")
         return ok
     }
 
