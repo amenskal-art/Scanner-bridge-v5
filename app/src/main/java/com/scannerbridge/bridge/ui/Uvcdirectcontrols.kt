@@ -39,10 +39,14 @@ class UvcDirectControls private constructor(
     // ---- UVC constants -----------------------------------------------------
     companion object {
         private const val TAG = "UvcDirect"
-        private const val TIMEOUT_MS = 400
+        // 400 ms proved too short on some webcams: they NAK EP0 requests
+        // while the isochronous stream is running and only answer after ~1 s.
+        // (That's also why the libuvc infinite-timeout path "worked".)
+        private const val TIMEOUT_MS = 1500
 
         private const val SET_CUR = 0x01
         private const val GET_CUR = 0x81
+        private const val GET_INFO = 0x86
         private const val GET_MIN = 0x82
         private const val GET_MAX = 0x83
         private const val REQ_SET = 0x21 // host->dev, class, interface
@@ -128,6 +132,23 @@ class UvcDirectControls private constructor(
             return UvcDirectControls(conn, vcIf, ctId, puId)
         }
 
+        /**
+         * Just the raw UsbDeviceConnection AUSBC opened, independent of
+         * whether direct controls are usable. The watchdog needs this to
+         * abort a control transfer wedged inside libuvc (closing the fd is
+         * the only thing that unblocks an infinite-timeout transfer).
+         */
+        fun connectionFrom(cam: MultiCameraClient.ICamera?): UsbDeviceConnection? {
+            cam ?: return null
+            val ctrlBlock = readField(cam, "mCtrlBlock") ?: return null
+            return try {
+                ctrlBlock.javaClass.getMethod("getConnection")
+                    .invoke(ctrlBlock) as? UsbDeviceConnection
+            } catch (_: Throwable) {
+                null
+            }
+        }
+
         private fun readField(obj: Any, name: String): Any? {
             var c: Class<*>? = obj.javaClass
             while (c != null) {
@@ -201,6 +222,24 @@ class UvcDirectControls private constructor(
     private fun scale(percent: Int, range: Pair<Int, Int>): Int {
         val p = percent.coerceIn(0, 100)
         return range.first + p * (range.second - range.first) / 100
+    }
+
+    /**
+     * One-shot health check, run at camera-open BEFORE this path is trusted.
+     * Some devices never answer class-specific requests sent through
+     * UsbDeviceConnection while libusb owns the interface; on those, every
+     * later SET would fail and controls would silently do nothing. A cheap
+     * GET_CUR (brightness on the PU, zoom on the CT as backup) tells us
+     * up-front whether this path is real on this hardware.
+     */
+    fun probe(): Boolean {
+        if (getReq(GET_CUR, processingUnitId, PU_BRIGHTNESS, 2) != null) return true
+        if (getReq(GET_CUR, cameraTerminalId, CT_ZOOM_ABS, 2) != null) return true
+        // one retry — first EP0 request right after stream start often NAKs
+        Thread.sleep(150)
+        val ok = getReq(GET_CUR, processingUnitId, PU_BRIGHTNESS, 2) != null
+        Log.i(TAG, "probe: direct control path ${if (ok) "OK" else "NOT available on this device"}")
+        return ok
     }
 
     // ---- public control API (all percent 0..100) ---------------------------
