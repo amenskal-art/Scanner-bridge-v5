@@ -7,6 +7,27 @@ import com.jiangdg.ausbc.MultiCameraClient
 /**
  * Sends UVC camera controls directly via Android's UsbDeviceConnection with a
  * REAL timeout, completely bypassing libuvc's control path.
+ *
+ * WHY THIS EXISTS:
+ * The libuvc bundled in AUSBC issues every control transfer with
+ * CTRL_TIMEOUT_MILLIS = 0, which libusb treats as INFINITE. When a cheap
+ * webcam stalls a control request (common under load while streaming), the
+ * calling thread blocks forever inside JNI *while holding the synchronized
+ * UVCCamera monitor*. Every other camera call then deadlocks behind that
+ * lock: controls die, closeCamera() hangs, and the app freezes.
+ *
+ * Android's UsbDeviceConnection.controlTransfer() takes a timeout in ms. We
+ * reuse the exact UsbDeviceConnection AUSBC already opened (same fd libusb
+ * uses, so the interface claim is valid) and talk UVC class-specific
+ * requests ourselves. A stalled request now returns -1 after TIMEOUT_MS
+ * instead of wedging a thread.
+ *
+ * Wire format (UVC 1.1 spec, §4.2):
+ *   requestType 0x21 (SET, class, interface) / 0xA1 (GET, class, interface)
+ *   request     SET_CUR=0x01, GET_CUR=0x81, GET_MIN=0x82, GET_MAX=0x83
+ *   wValue      control selector << 8
+ *   wIndex      (entity id << 8) | VideoControl interface number
+ *   data        little-endian value, size per control
  */
 class UvcDirectControls private constructor(
     private val conn: UsbDeviceConnection,
@@ -18,6 +39,9 @@ class UvcDirectControls private constructor(
     // ---- UVC constants -----------------------------------------------------
     companion object {
         private const val TAG = "UvcDirect"
+        // 400 ms proved too short on some webcams: they NAK EP0 requests
+        // while the isochronous stream is running and only answer after ~1 s.
+        // (That's also why the libuvc infinite-timeout path "worked".)
         private const val TIMEOUT_MS = 1500
 
         private const val SET_CUR = 0x01
@@ -45,9 +69,10 @@ class UvcDirectControls private constructor(
 
         /**
          * Builds a UvcDirectControls from AUSBC's camera object by pulling the
-         * UsbDeviceConnection it already opened and parsing the USB descriptors for the
+         * UsbDeviceConnection it already opened (ICamera.mCtrlBlock, a
+         * protected field) and parsing the USB descriptors for the
          * VideoControl interface number, Camera Terminal ID, and Processing
-         * Unit ID.
+         * Unit ID (they differ between webcam models).
          */
         fun from(cam: MultiCameraClient.ICamera?): UvcDirectControls? {
             cam ?: return null
@@ -63,40 +88,43 @@ class UvcDirectControls private constructor(
                 null
             } ?: return null
 
+            val raw = try { conn.rawDescriptors } catch (t: Throwable) { null }
+            if (raw == null || raw.size < 12) {
+                Log.w(TAG, "rawDescriptors unavailable")
+                return null
+            }
+
             var vcIf = -1
             var ctId = -1
             var puId = -1
-
-            val raw = try { conn.rawDescriptors } catch (t: Throwable) { null }
-            if (raw != null && raw.size >= 12) {
-                var inVc = false
-                var i = 0
-                while (i + 1 < raw.size) {
-                    val len = raw[i].toInt() and 0xFF
-                    if (len < 2 || i + len > raw.size) break
-                    val type = raw[i + 1].toInt() and 0xFF
-                    when (type) {
-                        0x04 -> { // standard INTERFACE descriptor
-                            val ifNum = raw[i + 2].toInt() and 0xFF
-                            val klass = raw[i + 5].toInt() and 0xFF
-                            val sub = raw[i + 6].toInt() and 0xFF
-                            inVc = (klass == 0x0E && sub == 0x01) // Video / VideoControl
-                            if (inVc) vcIf = ifNum
-                        }
-                        0x24 -> if (inVc && len >= 4) { // class-specific VC descriptor
-                            when (raw[i + 2].toInt() and 0xFF) { // subtype
-                                0x02 -> if (ctId < 0) ctId = raw[i + 3].toInt() and 0xFF // INPUT_TERMINAL
-                                0x05 -> if (puId < 0) puId = raw[i + 3].toInt() and 0xFF // PROCESSING_UNIT
-                            }
+            var inVc = false
+            var i = 0
+            while (i + 1 < raw.size) {
+                val len = raw[i].toInt() and 0xFF
+                if (len < 2 || i + len > raw.size) break
+                val type = raw[i + 1].toInt() and 0xFF
+                when (type) {
+                    0x04 -> { // standard INTERFACE descriptor
+                        val ifNum = raw[i + 2].toInt() and 0xFF
+                        val klass = raw[i + 5].toInt() and 0xFF
+                        val sub = raw[i + 6].toInt() and 0xFF
+                        inVc = (klass == 0x0E && sub == 0x01) // Video / VideoControl
+                        if (inVc) vcIf = ifNum
+                    }
+                    0x24 -> if (inVc && len >= 4) { // class-specific VC descriptor
+                        when (raw[i + 2].toInt() and 0xFF) { // subtype
+                            0x02 -> if (ctId < 0) ctId = raw[i + 3].toInt() and 0xFF // INPUT_TERMINAL
+                            0x05 -> if (puId < 0) puId = raw[i + 3].toInt() and 0xFF // PROCESSING_UNIT
                         }
                     }
-                    i += len
                 }
-            } else {
-                Log.w(TAG, "rawDescriptors unavailable, constructing with standard defaults")
+                i += len
             }
 
-            // Fail-safe: Fall back to consumer defaults if descriptors failed to return or parse
+            // Fail-safe: if descriptor parsing came up short, fall back to the
+            // layout used by virtually every consumer webcam (VideoControl on
+            // interface 0, Camera Terminal id 1, Processing Unit id 2), so
+            // controls keep working without any debugging.
             if (vcIf < 0) vcIf = 0
             if (ctId < 0) ctId = 1
             if (puId < 0) puId = 2
@@ -104,6 +132,12 @@ class UvcDirectControls private constructor(
             return UvcDirectControls(conn, vcIf, ctId, puId)
         }
 
+        /**
+         * Just the raw UsbDeviceConnection AUSBC opened, independent of
+         * whether direct controls are usable. The watchdog needs this to
+         * abort a control transfer wedged inside libuvc (closing the fd is
+         * the only thing that unblocks an infinite-timeout transfer).
+         */
         fun connectionFrom(cam: MultiCameraClient.ICamera?): UsbDeviceConnection? {
             cam ?: return null
             val ctrlBlock = readField(cam, "mCtrlBlock") ?: return null
@@ -122,7 +156,8 @@ class UvcDirectControls private constructor(
                     val f = c.getDeclaredField(name)
                     f.isAccessible = true
                     return f.get(obj)
-                } catch (_: NoSuchFieldException) {}
+                } catch (_: NoSuchFieldException) {
+                }
                 c = c.superclass
             }
             return null
@@ -136,8 +171,15 @@ class UvcDirectControls private constructor(
     private val ranges = java.util.concurrent.ConcurrentHashMap<Int, Pair<Int, Int>>()
     @Volatile private var aeManualSet = false
 
+    // Tracks whether we already forced auto-WB off, so a wb_temp slider drag
+    // sends ONE transfer per tick instead of two. Cheap UVC firmware wedges
+    // its control endpoint when EP0 is flooded while streaming; halving the
+    // traffic on the hottest control matters.
     @Volatile private var wbAutoOffSent = false
 
+    // All EP0 control transfers are serialized. Two overlapping control
+    // transfers on the same device fd (e.g. old + replacement control thread
+    // during a recovery) is a classic way to stall cheap webcam firmware.
     private val transferLock = Any()
 
     // ---- raw transfer helpers ---------------------------------------------
@@ -167,6 +209,7 @@ class UvcDirectControls private constructor(
         if (r < 0) return null
         var v = 0
         for (b in 0 until size) v = v or ((buf[b].toInt() and 0xFF) shl (8 * b))
+        // sign-extend 2-byte values (brightness etc. can be negative)
         if (size == 2 && (v and 0x8000) != 0) v = v or -0x10000
         return v
     }
@@ -188,53 +231,22 @@ class UvcDirectControls private constructor(
     }
 
     /**
-     * Executes a low-level USB GET_DESCRIPTOR request on the Device Descriptor (Endpoint 0).
-     * This is handled entirely in device core firmware and acts as a foolproof check to
-     * see if the underlying UsbDeviceConnection can issue control transfers.
-     */
-    private fun probeStandardUsb(): Boolean {
-        val buf = ByteArray(18)
-        val r = try {
-            synchronized(transferLock) {
-                conn.controlTransfer(
-                    0x80, // REQ_DIR_IN | REQ_TYPE_STANDARD | REQ_RECIP_DEVICE
-                    0x06, // GET_DESCRIPTOR
-                    0x0100, // (USB_DT_DEVICE << 8)
-                    0,
-                    buf,
-                    18,
-                    TIMEOUT_MS
-                )
-            }
-        } catch (t: Throwable) {
-            -1
-        }
-        return r >= 0
-    }
-
-    /**
-     * Probes the USB control path. 
-     * If standard USB control transfers work, we assume the physical path is alive. 
-     * We attempt standard UVC PU/CT requests. Even if those specific requests fail 
-     * (e.g. because of custom vendor IDs or unsupported controls), we still approve 
-     * the direct path because its reliable timeouts keep the native thread safe.
+     * One-shot health check, run at camera-open BEFORE this path is trusted.
+     * Some devices never answer class-specific requests sent through
+     * UsbDeviceConnection while libusb owns the interface; on those, every
+     * later SET would fail and controls would silently do nothing. A cheap
+     * GET_CUR (brightness on the PU, zoom on the CT as backup) tells us
+     * up-front whether this path is real on this hardware.
      */
     fun probe(): Boolean {
-        if (!probeStandardUsb()) {
-            Log.w(TAG, "probe: standard USB control transfer failed")
-            diagSink?.invoke("Direct USB path not answering (standard probe failed)")
-            return false
-        }
-
-        // Try standard class requests with the discovered/default selectors
         if (getReq(GET_CUR, processingUnitId, PU_BRIGHTNESS, 2) != null) return true
         if (getReq(GET_CUR, cameraTerminalId, CT_ZOOM_ABS, 2) != null) return true
-        
-        try { Thread.sleep(150) } catch (_: InterruptedException) {}
-        if (getReq(GET_CUR, processingUnitId, PU_BRIGHTNESS, 2) != null) return true
-
-        Log.i(TAG, "probe: standard USB transfers OK, but UVC PU/CT GET requests failed. Trusting direct path.")
-        return true
+        // one retry — first EP0 request right after stream start often NAKs
+        Thread.sleep(150)
+        val ok = getReq(GET_CUR, processingUnitId, PU_BRIGHTNESS, 2) != null
+        Log.i(TAG, "probe: direct control path ${if (ok) "OK" else "NOT available on this device"}")
+        if (!ok) diagSink?.invoke("Direct USB path not answering (probe failed)")
+        return ok
     }
 
     // ---- public control API (all percent 0..100) ---------------------------
@@ -254,6 +266,8 @@ class UvcDirectControls private constructor(
 
     fun setWbTempPercent(percent: Int): Boolean {
         if (processingUnitId < 0) return false
+        // Manual temp requires auto-WB off — but send that byte only once,
+        // not on every slider tick.
         if (!wbAutoOffSent) {
             if (setCur(processingUnitId, PU_WB_TEMP_AUTO, 0, 1)) wbAutoOffSent = true
         }
@@ -270,8 +284,9 @@ class UvcDirectControls private constructor(
     fun setExposurePercent(percent: Int): Boolean {
         if (cameraTerminalId < 0) return false
         if (!aeManualSet) {
+            // AE mode bitmap: 1=manual, 2=auto, 4=shutter prio, 8=aperture prio
             val ok = setCur(cameraTerminalId, CT_AE_MODE, 1, 1)
-            if (!ok) setCur(cameraTerminalId, CT_AE_MODE, 4, 1)
+            if (!ok) setCur(cameraTerminalId, CT_AE_MODE, 4, 1) // shutter-prio fallback
             aeManualSet = true
         }
         val range = rangeOf(cameraTerminalId, CT_EXPOSURE_TIME_ABS, 4, 1, 5000)
