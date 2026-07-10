@@ -294,8 +294,22 @@ class MainActivity : AppCompatActivity(),
     private var controlThread = android.os.HandlerThread("ScannerControlThread").apply { start() }
     private var controlHandler = Handler(controlThread.looper)
 
+    // Set on every camera-open. For the first CONTROL_QUIET_MS after an open
+    // NO control write reaches the camera: libusb issues its own control
+    // traffic while the stream spins up, and mixing our writes into that
+    // window is what wedges this camera's firmware (field-tested). Writes
+    // requested during the window aren't lost — they stay queued and flush
+    // the moment the window closes.
+    @Volatile private var cameraOpenedAt = 0L
+    private val CONTROL_QUIET_MS = 3000L
+
     private val writePendingControlsRunnable = object : Runnable {
         override fun run() {
+            val quietLeft = (cameraOpenedAt + CONTROL_QUIET_MS) - System.currentTimeMillis()
+            if (quietLeft > 0) {
+                controlHandler.postDelayed(this, quietLeft)
+                return
+            }
             val names = ArrayList(pendingControls.keys)
             for (n in names) {
                 val v = pendingControls.remove(n) ?: continue
@@ -350,13 +364,27 @@ class MainActivity : AppCompatActivity(),
         // wedged inside libuvc (its timeout is infinite) and releases the
         // UVCCamera monitor the wedged thread holds. Only AFTER that can
         // closeCamera()/openCamera() actually run — calling them first just
-        // queued them behind the dead monitor forever, which is why the old
-        // recovery never brought controls back.
-        cameraFragment?.ctlAbortStuckControl()
-        cameraFragment?.ctlRecoverCamera()
+        // queued them behind the dead monitor forever.
+        //
+        // CRITICAL: run the whole sequence OFF the main thread. closeCamera()
+        // inside ctlRecoverCamera has to take the UVCCamera monitor; if the
+        // wedged thread hasn't fully released it yet, that call blocks. On
+        // the main thread that block was an ANR — the app "froze" while the
+        // stream (separate threads) kept running. On a worker it's harmless.
+        thread(name = "ScannerRecovery") {
+            try {
+                cameraFragment?.ctlAbortStuckControl()
+                // Give the aborted transfer a beat to unwind out of JNI and
+                // release the monitor before we try to take it.
+                try { Thread.sleep(300) } catch (_: InterruptedException) {}
+                cameraFragment?.ctlRecoverCamera()
+            } catch (t: Throwable) {
+                android.util.Log.w("MainActivity", "recovery sequence threw", t)
+            }
+        }
 
         // Allow another recovery attempt after things settle.
-        ui.postDelayed({ recovering = false }, 5000)
+        ui.postDelayed({ recovering = false }, 8000)
     }
 
     // ---------------- on-screen control diagnostics ----------------
@@ -546,11 +574,24 @@ class MainActivity : AppCompatActivity(),
         }
     }
 
-    private fun applyInitialCameraControls() {
-        // Delay well past stream startup: libusb issues its own control
-        // traffic while the stream spins up, and mixing our writes into that
-        // window is what wedges this camera's firmware.
-        ui.postDelayed({ applyInitialCameraControlsNow() }, 1500)
+    // Bumped on every camera open/close. The delayed initial-controls burst
+    // only fires if its generation still matches — so when the camera
+    // reopens 3 times in quick succession after a USB reset (AUSBC's
+    // attach-triggered open racing our recovery reopen), only ONE burst of
+    // 9 writes reaches the camera instead of three stacked bursts flooding
+    // EP0 right when the firmware is most fragile.
+    @Volatile private var openGeneration = 0
+    private var pendingInitialControls: Runnable? = null
+
+    private fun applyInitialCameraControls(gen: Int) {
+        pendingInitialControls?.let { ui.removeCallbacks(it) }
+        val r = Runnable {
+            if (gen == openGeneration && cameraReady) applyInitialCameraControlsNow()
+        }
+        pendingInitialControls = r
+        // Past the CONTROL_QUIET_MS window: the writer thread wouldn't send
+        // earlier anyway, this just avoids pointless queue churn.
+        ui.postDelayed(r, CONTROL_QUIET_MS + 200)
     }
 
     private fun applyInitialCameraControlsNow() {
@@ -708,11 +749,13 @@ class MainActivity : AppCompatActivity(),
     // ---------------- camera callbacks ----------------
     override fun onCameraOpened(width: Int, height: Int) {
         cameraReady = true
+        cameraOpenedAt = System.currentTimeMillis()
+        val gen = ++openGeneration
         lastApplied.clear() // fresh device state -> re-send everything
         if (frameBridge != null) {
             cameraFragment?.frameBridge = frameBridge
         }
-        applyInitialCameraControls()
+        applyInitialCameraControls(gen)
         runOnUiThread {
             binding.previewPlaceholder.visibility = View.GONE
             updateUi()
@@ -721,6 +764,8 @@ class MainActivity : AppCompatActivity(),
 
     override fun onCameraClosed() {
         cameraReady = false
+        openGeneration++
+        pendingInitialControls?.let { ui.removeCallbacks(it) }
         runOnUiThread {
             binding.previewPlaceholder.visibility = View.VISIBLE
             updateUi()
