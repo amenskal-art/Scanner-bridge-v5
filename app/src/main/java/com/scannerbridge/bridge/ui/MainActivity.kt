@@ -547,8 +547,10 @@ class MainActivity : AppCompatActivity(),
     }
 
     private fun applyInitialCameraControls() {
-        // Delay well past stream startup to allow Direct Uvc Controls to finish probing at 1200ms first.
-        ui.postDelayed({ applyInitialCameraControlsNow() }, 2000)
+        // Delay well past stream startup: libusb issues its own control
+        // traffic while the stream spins up, and mixing our writes into that
+        // window is what wedges this camera's firmware.
+        ui.postDelayed({ applyInitialCameraControlsNow() }, 1500)
     }
 
     private fun applyInitialCameraControlsNow() {
