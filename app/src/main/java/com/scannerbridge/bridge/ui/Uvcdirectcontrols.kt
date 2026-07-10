@@ -43,6 +43,8 @@ class UvcDirectControls private constructor(
         // while the isochronous stream is running and only answer after ~1 s.
         // (That's also why the libuvc infinite-timeout path "worked".)
         private const val TIMEOUT_MS = 1500
+        // Enforced pause between consecutive EP0 transfers (see lastXferAt).
+        private const val MIN_XFER_GAP_MS = 60L
 
         private const val SET_CUR = 0x01
         private const val GET_CUR = 0x81
@@ -182,36 +184,69 @@ class UvcDirectControls private constructor(
     // during a recovery) is a classic way to stall cheap webcam firmware.
     private val transferLock = Any()
 
+    // Minimum gap between ANY two EP0 transfers on this device. First-use of
+    // a control is a 3-5 transfer sequence (GET_MIN, GET_MAX, SET, plus mode
+    // bytes); firing those back-to-back while the isochronous stream is
+    // saturating the bus is what wedged the firmware mid-burst (field log:
+    // failures starting at cs=0x7 a few seconds after open). Guarded by
+    // transferLock.
+    private var lastXferAt = 0L
+
+    private fun rawTransfer(
+        reqType: Int, req: Int, wValue: Int, wIndex: Int, buf: ByteArray, size: Int
+    ): Int = synchronized(transferLock) {
+        val gap = MIN_XFER_GAP_MS - (System.currentTimeMillis() - lastXferAt)
+        if (gap > 0) try { Thread.sleep(gap) } catch (_: InterruptedException) {}
+        val r = conn.controlTransfer(reqType, req, wValue, wIndex, buf, size, TIMEOUT_MS)
+        lastXferAt = System.currentTimeMillis()
+        r
+    }
+
     // ---- raw transfer helpers ---------------------------------------------
 
     private fun setCur(entity: Int, cs: Int, value: Int, size: Int): Boolean {
         val buf = ByteArray(size)
         for (b in 0 until size) buf[b] = ((value shr (8 * b)) and 0xFF).toByte()
-        val r = synchronized(transferLock) {
-            conn.controlTransfer(
-                REQ_SET, SET_CUR, cs shl 8, (entity shl 8) or vcInterface, buf, size, TIMEOUT_MS
-            )
+        var r = rawTransfer(REQ_SET, SET_CUR, cs shl 8, (entity shl 8) or vcInterface, buf, size)
+        if (r < 0) {
+            // One retry after a beat: a NAK window during heavy stream load
+            // often clears within a couple hundred ms. This turns transient
+            // failures into successes instead of feeding the fail streak.
+            try { Thread.sleep(250) } catch (_: InterruptedException) {}
+            r = rawTransfer(REQ_SET, SET_CUR, cs shl 8, (entity shl 8) or vcInterface, buf, size)
         }
         if (r < 0) {
             Log.w(TAG, "SET_CUR entity=$entity cs=0x${cs.toString(16)} val=$value FAILED ($r)")
-            diagSink?.invoke("USB write failed: cs=0x${cs.toString(16)} r=$r")
+            diagSink?.invoke("USB write failed: ${csName(entity, cs)} r=$r")
         }
         return r >= 0
     }
 
     private fun getReq(req: Int, entity: Int, cs: Int, size: Int): Int? {
         val buf = ByteArray(size)
-        val r = synchronized(transferLock) {
-            conn.controlTransfer(
-                REQ_GET, req, cs shl 8, (entity shl 8) or vcInterface, buf, size, TIMEOUT_MS
-            )
-        }
+        val r = rawTransfer(REQ_GET, req, cs shl 8, (entity shl 8) or vcInterface, buf, size)
         if (r < 0) return null
         var v = 0
         for (b in 0 until size) v = v or ((buf[b].toInt() and 0xFF) shl (8 * b))
         // sign-extend 2-byte values (brightness etc. can be negative)
         if (size == 2 && (v and 0x8000) != 0) v = v or -0x10000
         return v
+    }
+
+    /** Human-readable control name for on-screen diagnostics. */
+    private fun csName(entity: Int, cs: Int): String {
+        if (entity == processingUnitId) return when (cs) {
+            PU_BRIGHTNESS -> "brightness"; PU_CONTRAST -> "contrast"
+            PU_GAIN -> "gain"; PU_SATURATION -> "saturation"
+            PU_SHARPNESS -> "sharpness"; PU_GAMMA -> "gamma"
+            PU_WB_TEMP -> "WB temp"; PU_WB_TEMP_AUTO -> "auto WB"
+            else -> "PU cs=0x${cs.toString(16)}"
+        }
+        return when (cs) {
+            CT_AE_MODE -> "AE mode"; CT_EXPOSURE_TIME_ABS -> "exposure"
+            CT_ZOOM_ABS -> "zoom"
+            else -> "CT cs=0x${cs.toString(16)}"
+        }
     }
 
     private fun rangeOf(entity: Int, cs: Int, size: Int, defMin: Int, defMax: Int): Pair<Int, Int> {
