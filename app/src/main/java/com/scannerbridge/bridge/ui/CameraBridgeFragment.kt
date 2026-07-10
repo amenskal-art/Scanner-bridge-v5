@@ -55,6 +55,16 @@ class CameraBridgeFragment : CameraFragment() {
     // UVCCamera monitor and freeze the app.
     @Volatile private var direct: UvcDirectControls? = null
 
+    /**
+     * True while the timeout-safe direct path is handling controls. The
+     * MainActivity watchdog uses this: on the direct path a "busy" control
+     * write is just transfers timing out safely (a first-use sequence is 3-5
+     * transfers x 1.5 s worst case = up to ~7.5 s), NOT a wedged thread — so
+     * the 4 s reset threshold must not apply. Only the libuvc path can hang
+     * forever.
+     */
+    fun isDirectControlActive(): Boolean = direct != null
+
     // Raw USB connection AUSBC opened — kept so the watchdog can close() it
     // to abort a control transfer wedged inside libuvc's infinite timeout.
     @Volatile private var usbConn: android.hardware.usb.UsbDeviceConnection? = null
@@ -254,33 +264,40 @@ class CameraBridgeFragment : CameraFragment() {
      */
     fun ctlRecoverCamera() {
         expInited = false
-        val delayMs = if (deviceWasReset) 2500L else 800L
+        val wasReset = deviceWasReset
         deviceWasReset = false
         try {
             closeCamera()
         } catch (t: Throwable) {
             Log.w("CameraBridge", "ctlRecoverCamera: closeCamera threw", t)
         }
-        val tryOpen = Runnable {
+        val tryOpenIfNeeded = Runnable {
+            // Only open if the camera hasn't already come back. After a real
+            // USB reset the device re-enumerates and AUSBC's attach handling
+            // reopens it BY ITSELF — our unconditional reopen plus the retry
+            // used to race that, producing 3 opens (and 3 "Scanner connected"
+            // lines, and 3 scheduled control bursts) per reset.
+            if (usbConn != null) return@Runnable
             try {
                 openCamera(getCameraView())
             } catch (t: Throwable) {
                 Log.w("CameraBridge", "ctlRecoverCamera: openCamera threw", t)
             }
         }
-        mainH.postDelayed({
-            tryOpen.run()
-            // Retry once more ONLY if the camera didn't come up (e.g. the
-            // reopen raced the post-reset re-enumeration). The usbConn check
-            // prevents the double-open storm that used to produce a burst of
-            // "Scanner connected" messages after every reset.
+        if (wasReset) {
+            // Give the re-enumeration + AUSBC's own attach-open 4 s to land;
+            // step in only if it didn't, with one further retry.
             mainH.postDelayed({
-                if (usbConn == null) {
-                    Log.w("CameraBridge", "ctlRecoverCamera: retrying open after reset")
-                    tryOpen.run()
-                }
-            }, 3000)
-        }, delayMs)
+                tryOpenIfNeeded.run()
+                mainH.postDelayed({ tryOpenIfNeeded.run() }, 3000)
+            }, 4000)
+        } else {
+            // fd-close only (no re-enumeration): nothing reopens on its own.
+            mainH.postDelayed({
+                tryOpenIfNeeded.run()
+                mainH.postDelayed({ tryOpenIfNeeded.run() }, 3000)
+            }, 800)
+        }
     }
 
     private fun resolveActualPreviewSize() {
@@ -437,14 +454,24 @@ class CameraBridgeFragment : CameraFragment() {
         }
         val streak = ++directFailStreak
         val now = System.currentTimeMillis()
-        if (streak >= 10 && now - lastAutoRecoverAt > 20000) {
+        if (streak >= 6 && now - lastAutoRecoverAt > 20000) {
             lastAutoRecoverAt = now
             directFailStreak = 0
-            Log.w("CameraBridge", "direct control writes failing repeatedly — recovering camera")
-            diag("Controls failing repeatedly \u2014 restarting scanner\u2026", true)
-            // Recovery includes closeCamera(), which may block briefly —
-            // never run it on the main thread.
-            Thread({ ctlRecoverCamera() }, "ScannerRecovery-direct").start()
+            Log.w("CameraBridge", "direct control writes failing repeatedly — resetting camera")
+            diag("Controls failing repeatedly \u2014 resetting scanner\u2026", true)
+            // 6+ consecutive timeouts means the firmware's control endpoint
+            // has wedged. close/reopen alone does NOT unwedge it (field
+            // tested) — only a real USB port reset power-cycles the device
+            // logic. Run the full abort+reset+recover sequence, off-main.
+            Thread({
+                try {
+                    ctlAbortStuckControl()
+                    try { Thread.sleep(300) } catch (_: InterruptedException) {}
+                    ctlRecoverCamera()
+                } catch (t: Throwable) {
+                    Log.w("CameraBridge", "streak recovery threw", t)
+                }
+            }, "ScannerRecovery-direct").start()
         }
     }
 
