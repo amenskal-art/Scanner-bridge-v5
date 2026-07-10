@@ -314,7 +314,16 @@ class MainActivity : AppCompatActivity(),
             for (n in names) {
                 val v = pendingControls.remove(n) ?: continue
                 if (lastApplied[n] == v) continue // no change -> no USB traffic
-                controlBusySince = System.currentTimeMillis()
+                // Arm the watchdog ONLY for libuvc writes. Direct-path writes
+                // have a real kernel-enforced timeout on every transfer and
+                // CANNOT hang forever — but a first-use sequence on a slow,
+                // loaded camera (range GETs + mode byte + SET + retry, each
+                // up to 4 s) can legitimately take well over any sane
+                // watchdog threshold. Watching those produced the round-5
+                // false reset. Only libuvc's infinite-timeout transfers can
+                // genuinely wedge, so only they are watched.
+                val watched = cameraFragment?.isDirectControlActive() != true
+                if (watched) controlBusySince = System.currentTimeMillis()
                 try {
                     applyControlToCamera(n, v)
                     lastApplied[n] = v
@@ -347,18 +356,11 @@ class MainActivity : AppCompatActivity(),
     private fun checkControlWatchdog() {
         val since = controlBusySince
         if (since == 0L || recovering) return
-        // The 4 s threshold exists for the libuvc path, whose control
-        // transfers have an INFINITE timeout — >4 s busy there means a thread
-        // is wedged in JNI forever. On the DIRECT path every transfer has a
-        // real 1.5 s timeout, and one control's first use is a 3-5 transfer
-        // sequence (range GETs + mode byte + SET) that can legitimately stay
-        // busy ~7.5 s when the camera is timing out each request. Resetting
-        // at 4 s there was a FALSE trigger — it reset a camera whose writes
-        // were failing *safely* and restarted the whole storm. 15 s on the
-        // direct path only catches a genuine kernel-level hang.
-        val threshold =
-            if (cameraFragment?.isDirectControlActive() == true) 15000L else 4000L
-        if (System.currentTimeMillis() - since < threshold) return
+        // controlBusySince is only ever armed for LIBUVC writes now (the
+        // direct path self-timeouts and is never watched), so >4 s here
+        // unambiguously means a thread wedged in an infinite-timeout JNI
+        // transfer — the one case where the nuclear reset is correct.
+        if (System.currentTimeMillis() - since < 4000) return
 
         recovering = true
         controlBusySince = 0L
