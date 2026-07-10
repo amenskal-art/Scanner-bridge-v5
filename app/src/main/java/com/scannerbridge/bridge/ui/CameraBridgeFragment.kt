@@ -27,14 +27,22 @@ class CameraBridgeFragment : CameraFragment() {
         fun onControlDiag(message: String, isError: Boolean) {}
     }
 
-    // Throttle diag spam: at most one error message per 2 s reaches the UI.
+    // Throttle diag spam: at most one error message per 2 s reaches the UI,
+    // and an identical info message repeated within 2 s is dropped (duplicate
+    // OPENED events after a USB reset used to print "controls ready" 3-4x).
     @Volatile private var lastDiagErrAt = 0L
+    @Volatile private var lastDiagMsg = ""
+    @Volatile private var lastDiagMsgAt = 0L
     private fun diag(msg: String, err: Boolean = false) {
+        val now = System.currentTimeMillis()
         if (err) {
-            val now = System.currentTimeMillis()
             if (now - lastDiagErrAt < 2000) return
             lastDiagErrAt = now
+        } else {
+            if (msg == lastDiagMsg && now - lastDiagMsgAt < 2000) return
         }
+        lastDiagMsg = msg
+        lastDiagMsgAt = now
         try { callbacks?.onControlDiag(msg, err) } catch (_: Throwable) {}
     }
 
@@ -129,15 +137,32 @@ class CameraBridgeFragment : CameraFragment() {
             ICameraStateCallBack.State.OPENED -> {
                 expInited = false
                 directFailStreak = 0
+                directFirstUseFails = 0
+                directEverOk = false
                 usbConn = UvcDirectControls.connectionFrom(getCurrentCamera())
-                // DO NOT touch EP0 here — no probing, no direct-path setup.
-                // Field test showed that sending raw control transfers while
-                // libusb is negotiating stream startup wedges this camera's
-                // firmware for the whole session (every later control write
-                // then stalls). Controls use the libuvc path exclusively,
-                // protected by the watchdog + real USB reset.
-                direct = null
-                Log.i("CameraBridge", "control path: LIBUVC (direct disabled)")
+                // Build the timeout-safe direct path WITHOUT touching EP0.
+                // Construction only parses the kernel-cached USB descriptors
+                // (getRawDescriptors is a usbfs ioctl — zero bus traffic) and
+                // probe() is intentionally NOT called: field test showed that
+                // sending raw control transfers while libusb is negotiating
+                // stream startup wedges this camera's firmware for the whole
+                // session. The first real transfer on this path happens only
+                // when a control is actually changed, and MainActivity gates
+                // all control writes behind a quiet period after open.
+                //
+                // Every write on this path has a REAL 1.5 s timeout, so a
+                // stalled request returns -1 instead of wedging a thread
+                // inside libuvc's infinite-timeout JNI while holding the
+                // UVCCamera monitor. The watchdog + USB reset remain as a
+                // last resort, no longer the primary recovery.
+                direct = UvcDirectControls.from(getCurrentCamera())?.also { d ->
+                    d.diagSink = { msg -> diag(msg, true) }
+                }
+                Log.i(
+                    "CameraBridge",
+                    "control path: " + if (direct != null)
+                        "DIRECT (timeout-safe, lazy init)" else "LIBUVC (direct unavailable)"
+                )
                 diag("Scanner connected \u2014 controls ready")
                 resolveActualPreviewSize()
                 frameBridge?.setResolution(frameW, frameH)
@@ -184,6 +209,7 @@ class CameraBridgeFragment : CameraFragment() {
     fun ctlAbortStuckControl() {
         val conn = usbConn
         usbConn = null
+        direct = null   // it holds this same connection; unusable after close
         // 1) Try a REAL USB device reset (hidden API, works on many devices).
         //    Closing the fd only unblocks OUR thread; the camera's firmware
         //    stays wedged and the next write stalls again. A port reset
@@ -215,6 +241,17 @@ class CameraBridgeFragment : CameraFragment() {
     // fires while the device is still enumerating.
     @Volatile private var deviceWasReset = false
 
+    // Main-looper handler for the parts of recovery that must touch views.
+    private val mainH = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /**
+     * Safe to call from ANY thread — and it SHOULD be called from a
+     * background thread. closeCamera() has to acquire the UVCCamera monitor;
+     * if a wedged control transfer hasn't fully released it yet, that call
+     * blocks. Running it on the caller's (background) thread means a slow
+     * release stalls a worker, not the main thread — this was the cause of
+     * the "app freezes but keeps streaming" ANRs during recovery.
+     */
     fun ctlRecoverCamera() {
         expInited = false
         val delayMs = if (deviceWasReset) 2500L else 800L
@@ -224,21 +261,23 @@ class CameraBridgeFragment : CameraFragment() {
         } catch (t: Throwable) {
             Log.w("CameraBridge", "ctlRecoverCamera: closeCamera threw", t)
         }
-        val tryOpen = {
+        val tryOpen = Runnable {
             try {
                 openCamera(getCameraView())
             } catch (t: Throwable) {
                 Log.w("CameraBridge", "ctlRecoverCamera: openCamera threw", t)
             }
         }
-        view?.postDelayed({
-            tryOpen()
-            // Retry once more if the camera didn't come up (e.g. the reopen
-            // raced the post-reset re-enumeration). Harmless if already open.
-            view?.postDelayed({
+        mainH.postDelayed({
+            tryOpen.run()
+            // Retry once more ONLY if the camera didn't come up (e.g. the
+            // reopen raced the post-reset re-enumeration). The usbConn check
+            // prevents the double-open storm that used to produce a burst of
+            // "Scanner connected" messages after every reset.
+            mainH.postDelayed({
                 if (usbConn == null) {
                     Log.w("CameraBridge", "ctlRecoverCamera: retrying open after reset")
-                    tryOpen()
+                    tryOpen.run()
                 }
             }, 3000)
         }, delayMs)
@@ -372,10 +411,28 @@ class CameraBridgeFragment : CameraFragment() {
     // one automatic recovery instead of silently eating writes forever.
     @Volatile private var directFailStreak = 0
     @Volatile private var lastAutoRecoverAt = 0L
+    // First-use validation, replacing the old startup probe(): some devices
+    // never answer app-level control transfers while libusb owns the
+    // interface. If the FIRST few direct writes all fail (path never worked
+    // once), fall back to the libuvc path for the session instead of eating
+    // every write. Once a direct write has succeeded, we never fall back —
+    // libuvc's infinite timeout is exactly what we're avoiding.
+    @Volatile private var directFirstUseFails = 0
+    @Volatile private var directEverOk = false
 
     private fun directResult(ok: Boolean) {
         if (ok) {
+            directEverOk = true
             directFailStreak = 0
+            directFirstUseFails = 0
+            return
+        }
+        if (!directEverOk) {
+            if (++directFirstUseFails >= 3) {
+                Log.w("CameraBridge", "direct path never answered — falling back to libuvc for this session")
+                diag("Direct USB path not answering \u2014 using library path", true)
+                direct = null
+            }
             return
         }
         val streak = ++directFailStreak
@@ -385,7 +442,9 @@ class CameraBridgeFragment : CameraFragment() {
             directFailStreak = 0
             Log.w("CameraBridge", "direct control writes failing repeatedly — recovering camera")
             diag("Controls failing repeatedly \u2014 restarting scanner\u2026", true)
-            view?.post { ctlRecoverCamera() }
+            // Recovery includes closeCamera(), which may block briefly —
+            // never run it on the main thread.
+            Thread({ ctlRecoverCamera() }, "ScannerRecovery-direct").start()
         }
     }
 
