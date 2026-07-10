@@ -347,7 +347,18 @@ class MainActivity : AppCompatActivity(),
     private fun checkControlWatchdog() {
         val since = controlBusySince
         if (since == 0L || recovering) return
-        if (System.currentTimeMillis() - since < 4000) return
+        // The 4 s threshold exists for the libuvc path, whose control
+        // transfers have an INFINITE timeout — >4 s busy there means a thread
+        // is wedged in JNI forever. On the DIRECT path every transfer has a
+        // real 1.5 s timeout, and one control's first use is a 3-5 transfer
+        // sequence (range GETs + mode byte + SET) that can legitimately stay
+        // busy ~7.5 s when the camera is timing out each request. Resetting
+        // at 4 s there was a FALSE trigger — it reset a camera whose writes
+        // were failing *safely* and restarted the whole storm. 15 s on the
+        // direct path only catches a genuine kernel-level hang.
+        val threshold =
+            if (cameraFragment?.isDirectControlActive() == true) 15000L else 4000L
+        if (System.currentTimeMillis() - since < threshold) return
 
         recovering = true
         controlBusySince = 0L
@@ -462,6 +473,7 @@ class MainActivity : AppCompatActivity(),
             if (other.isChecked != checked) {
                 other.isChecked = checked
             }
+            userTouched.add("auto_wb")
             enqueueControl("auto_wb", if (checked) 100 else 0)
             server?.controlState?.applyOne("auto_wb", if (checked) 100 else 0, "ui")
         }
@@ -482,10 +494,12 @@ class MainActivity : AppCompatActivity(),
                 if (name == "wb_temp") {
                     if (binding.cbAutoWb.isChecked) binding.cbAutoWb.isChecked = false
                     if (binding.fsCbAutoWb.isChecked) binding.fsCbAutoWb.isChecked = false
+                    userTouched.add("auto_wb")
                     enqueueControl("auto_wb", 0)
                     server?.controlState?.applyOne("auto_wb", 0, "ui")
                 }
                 
+                userTouched.add(name)
                 enqueueControl(name, value)
                 server?.controlState?.applyOne(name, value, "ui")
             }
@@ -529,6 +543,7 @@ class MainActivity : AppCompatActivity(),
                         "auto_wb"    -> if (cs.autoWb) 100 else 0
                         else -> continue
                     }
+                    userTouched.add(name)
                     enqueueControl(name, v)
                     
                     // Update portrait and fullscreen SeekBars simultaneously
@@ -594,6 +609,17 @@ class MainActivity : AppCompatActivity(),
         ui.postDelayed(r, CONTROL_QUIET_MS + 200)
     }
 
+    // Controls the user (or the PC) has actually adjusted this session.
+    // ONLY these are re-applied on camera open. The old behavior pushed all
+    // 9 controls on every open, and each control's FIRST direct write costs
+    // 3-5 USB transfers (range GETs + SET) — ~25 back-to-back EP0 transfers
+    // into a camera whose bus is saturated by the 1080p stream. That burst
+    // is what wedged the firmware a few seconds after every open (field log:
+    // failures from cs=0x7/saturation onward). Untouched controls keep the
+    // camera's own hardware defaults, which is what libuvc gave it anyway.
+    private val userTouched: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+
     private fun applyInitialCameraControlsNow() {
         runOnUiThread {
             val values = linkedMapOf(
@@ -610,7 +636,17 @@ class MainActivity : AppCompatActivity(),
             server?.controlState?.let { cs ->
                 for ((k, v) in values) cs.applyOne(k, v, "ui")
             }
-            for ((k, v) in values) enqueueControl(k, v)
+            var n = 0
+            for ((k, v) in values) {
+                if (k in userTouched) {
+                    enqueueControl(k, v)
+                    n++
+                }
+            }
+            android.util.Log.i(
+                "MainActivity",
+                "initial controls: re-applying $n adjusted control(s) (of ${values.size})"
+            )
         }
     }
 
