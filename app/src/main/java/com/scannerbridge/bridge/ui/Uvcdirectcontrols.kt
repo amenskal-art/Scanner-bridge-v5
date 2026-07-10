@@ -39,10 +39,13 @@ class UvcDirectControls private constructor(
     // ---- UVC constants -----------------------------------------------------
     companion object {
         private const val TAG = "UvcDirect"
-        // 400 ms proved too short on some webcams: they NAK EP0 requests
-        // while the isochronous stream is running and only answer after ~1 s.
-        // (That's also why the libuvc infinite-timeout path "worked".)
-        private const val TIMEOUT_MS = 1500
+        // 400 ms proved too short, and the round-5 field log proved 1500 ms
+        // is ALSO too short once the PC client is connected (full pipeline
+        // load): every SET returned -1 while libuvc's INFINITE timeout had
+        // always gotten the same writes through eventually — i.e. the camera
+        // answers, just slowly. 4 s is the compromise: long enough for a
+        // loaded camera to answer, still finite so nothing can wedge forever.
+        private const val TIMEOUT_MS = 4000
         // Enforced pause between consecutive EP0 transfers (see lastXferAt).
         private const val MIN_XFER_GAP_MS = 60L
 
@@ -204,20 +207,26 @@ class UvcDirectControls private constructor(
 
     // ---- raw transfer helpers ---------------------------------------------
 
+    /** Elapsed ms of the most recent successful SET — diagnostic breadcrumb. */
+    @Volatile var lastSetMs: Long = -1
+
     private fun setCur(entity: Int, cs: Int, value: Int, size: Int): Boolean {
         val buf = ByteArray(size)
         for (b in 0 until size) buf[b] = ((value shr (8 * b)) and 0xFF).toByte()
+        val t0 = System.currentTimeMillis()
         var r = rawTransfer(REQ_SET, SET_CUR, cs shl 8, (entity shl 8) or vcInterface, buf, size)
         if (r < 0) {
             // One retry after a beat: a NAK window during heavy stream load
-            // often clears within a couple hundred ms. This turns transient
+            // often clears within a few hundred ms. This turns transient
             // failures into successes instead of feeding the fail streak.
-            try { Thread.sleep(250) } catch (_: InterruptedException) {}
+            try { Thread.sleep(400) } catch (_: InterruptedException) {}
             r = rawTransfer(REQ_SET, SET_CUR, cs shl 8, (entity shl 8) or vcInterface, buf, size)
         }
         if (r < 0) {
             Log.w(TAG, "SET_CUR entity=$entity cs=0x${cs.toString(16)} val=$value FAILED ($r)")
             diagSink?.invoke("USB write failed: ${csName(entity, cs)} r=$r")
+        } else {
+            lastSetMs = System.currentTimeMillis() - t0
         }
         return r >= 0
     }
@@ -252,8 +261,12 @@ class UvcDirectControls private constructor(
     private fun rangeOf(entity: Int, cs: Int, size: Int, defMin: Int, defMax: Int): Pair<Int, Int> {
         val key = (entity shl 16) or cs
         ranges[key]?.let { return it }
+        // If GET_MIN doesn't answer, GET_MAX won't either — don't burn a
+        // second full timeout on it, go straight to the default range. The
+        // result is cached either way, so this costs at most once per
+        // control per session.
         val min = getReq(GET_MIN, entity, cs, size)
-        val max = getReq(GET_MAX, entity, cs, size)
+        val max = if (min != null) getReq(GET_MAX, entity, cs, size) else null
         val pair = if (min != null && max != null && max > min) min to max else defMin to defMax
         ranges[key] = pair
         Log.d(TAG, "range entity=$entity cs=0x${cs.toString(16)}: ${pair.first}..${pair.second}")
