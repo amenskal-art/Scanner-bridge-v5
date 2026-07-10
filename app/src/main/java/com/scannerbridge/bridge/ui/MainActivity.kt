@@ -1,295 +1,748 @@
 package com.scannerbridge.bridge.ui
 
-import android.hardware.usb.UsbDeviceConnection
-import android.util.Log
-import com.jiangdg.ausbc.MultiCameraClient
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.view.View
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.Toast
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import com.scannerbridge.bridge.CrashApp
+import com.scannerbridge.bridge.R
+import com.scannerbridge.bridge.databinding.ActivityMainBinding
+import com.scannerbridge.bridge.server.FrameBridge
+import com.scannerbridge.bridge.server.MjpegServer
+import com.scannerbridge.bridge.server.StreamForegroundService
+import com.scannerbridge.bridge.util.NetworkUtils
+import com.scannerbridge.bridge.util.PairingClient
+import kotlin.concurrent.thread
 
 /**
- * Sends UVC camera controls directly via Android's UsbDeviceConnection with a
- * REAL timeout, completely bypassing libuvc's control path.
- *
- * WHY THIS EXISTS:
- * The libuvc bundled in AUSBC issues every control transfer with
- * CTRL_TIMEOUT_MILLIS = 0, which libusb treats as INFINITE. When a cheap
- * webcam stalls a control request (common under load while streaming), the
- * calling thread blocks forever inside JNI *while holding the synchronized
- * UVCCamera monitor*. Every other camera call then deadlocks behind that
- * lock: controls die, closeCamera() hangs, and the app freezes.
- *
- * Android's UsbDeviceConnection.controlTransfer() takes a timeout in ms. We
- * reuse the exact UsbDeviceConnection AUSBC already opened (same fd libusb
- * uses, so the interface claim is valid) and talk UVC class-specific
- * requests ourselves. A stalled request now returns -1 after TIMEOUT_MS
- * instead of wedging a thread.
- *
- * Wire format (UVC 1.1 spec, §4.2):
- *   requestType 0x21 (SET, class, interface) / 0xA1 (GET, class, interface)
- *   request     SET_CUR=0x01, GET_CUR=0x81, GET_MIN=0x82, GET_MAX=0x83
- *   wValue      control selector << 8
- *   wIndex      (entity id << 8) | VideoControl interface number
- *   data        little-endian value, size per control
+ * Flow (PC shows the QR, this phone's webcam reads it):
+ *  1. Plug in the USB-C webcam -> live feed shows.
+ *  2. Tap "Scan PC Code". The webcam frames are scanned for the PC's QR.
+ *  3. On decode: parse {pc_ip, port, token}, start the MJPEG server, then POST
+ *     this phone's own stream address back to the PC gate.
+ *  4. PC auto-connects to this phone's stream.
  */
-class UvcDirectControls private constructor(
-    private val conn: UsbDeviceConnection,
-    private val vcInterface: Int,
-    private val cameraTerminalId: Int,
-    private val processingUnitId: Int
-) {
+class MainActivity : AppCompatActivity(),
+    CameraBridgeFragment.Callbacks, MjpegServer.Listener {
 
-    // ---- UVC constants -----------------------------------------------------
-    companion object {
-        private const val TAG = "UvcDirect"
-        // 400 ms proved too short on some webcams: they NAK EP0 requests
-        // while the isochronous stream is running and only answer after ~1 s.
-        // (That's also why the libuvc infinite-timeout path "worked".)
-        private const val TIMEOUT_MS = 1500
+    private lateinit var binding: ActivityMainBinding
 
-        private const val SET_CUR = 0x01
-        private const val GET_CUR = 0x81
-        private const val GET_INFO = 0x86
-        private const val GET_MIN = 0x82
-        private const val GET_MAX = 0x83
-        private const val REQ_SET = 0x21 // host->dev, class, interface
-        private const val REQ_GET = 0xA1 // dev->host, class, interface
+    private val streamPort = 8080
+    private var server: MjpegServer? = null
+    private var frameBridge: FrameBridge? = null
+    private var cameraFragment: CameraBridgeFragment? = null
 
-        // Camera Terminal control selectors
-        private const val CT_AE_MODE = 0x02            // 1 byte bitmap
-        private const val CT_EXPOSURE_TIME_ABS = 0x04  // 4 bytes, 100 µs units
-        private const val CT_ZOOM_ABS = 0x0B           // 2 bytes
+    private var cameraReady = false
+    private var streaming = false
+    private var scanning = false
+    private var pairedPcName = ""
 
-        // Processing Unit control selectors
-        const val PU_BRIGHTNESS = 0x02  // 2 bytes (signed)
-        const val PU_CONTRAST = 0x03    // 2 bytes
-        const val PU_GAIN = 0x04        // 2 bytes
-        const val PU_SATURATION = 0x07  // 2 bytes
-        const val PU_SHARPNESS = 0x08   // 2 bytes
-        const val PU_GAMMA = 0x09       // 2 bytes
-        const val PU_WB_TEMP = 0x0A     // 2 bytes
-        const val PU_WB_TEMP_AUTO = 0x0B // 1 byte
+    private val ui = Handler(Looper.getMainLooper())
 
-        /**
-         * Builds a UvcDirectControls from AUSBC's camera object by pulling the
-         * UsbDeviceConnection it already opened (ICamera.mCtrlBlock, a
-         * protected field) and parsing the USB descriptors for the
-         * VideoControl interface number, Camera Terminal ID, and Processing
-         * Unit ID (they differ between webcam models).
-         */
-        fun from(cam: MultiCameraClient.ICamera?): UvcDirectControls? {
-            cam ?: return null
-            val ctrlBlock = readField(cam, "mCtrlBlock") ?: run {
-                Log.w(TAG, "mCtrlBlock not found on ${cam.javaClass.name}")
-                return null
+    private val permReq = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestMultiplePermissions()
+    ) { attachCameraFragment() }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        binding = ActivityMainBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        requestedOrientation =
+            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+
+        binding.actionButton.setOnClickListener { toggleScanning() }
+        binding.stopButton.setOnClickListener { stopEverything() }
+        setupCameraControls()
+        setupFullscreen()
+
+        val lastCrash = CrashApp.readAndClear(application)
+        if (lastCrash != null) {
+            showCrashDialog(lastCrash)
+        }
+
+        requestRuntimePermissions()
+        startStatsTicker()
+        updateUi()
+    }
+
+    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
+        super.onConfigurationChanged(newConfig)
+        if (isFullscreen) {
+            binding.rootContainer.post {
+                val h = binding.rootContainer.height.takeIf { it > 0 }
+                    ?: resources.displayMetrics.heightPixels
+                binding.previewCard.layoutParams = binding.previewCard.layoutParams.apply {
+                    height = h
+                }
             }
-            val conn = try {
-                ctrlBlock.javaClass.getMethod("getConnection")
-                    .invoke(ctrlBlock) as? UsbDeviceConnection
+        }
+    }
+
+    private fun showCrashDialog(text: String) {
+        try {
+            androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("Previous crash details")
+                .setMessage(text.take(4000))
+                .setPositiveButton("Copy") { _, _ ->
+                    val cb = getSystemService(Context.CLIPBOARD_SERVICE)
+                            as android.content.ClipboardManager
+                    cb.setPrimaryClip(
+                        android.content.ClipData.newPlainText("crash", text))
+                    toast("Crash log copied")
+                }
+                .setNegativeButton("Dismiss", null)
+                .show()
+        } catch (_: Throwable) {}
+    }
+
+    // ---------------- permissions ----------------
+    private fun requestRuntimePermissions() {
+        val needed = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            != PackageManager.PERMISSION_GRANTED) needed += Manifest.permission.CAMERA
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED) needed += Manifest.permission.POST_NOTIFICATIONS
+        if (needed.isNotEmpty()) permReq.launch(needed.toTypedArray())
+        else attachCameraFragment()
+    }
+
+    private fun attachCameraFragment() {
+        if (cameraFragment != null) return
+        ui.post {
+            if (cameraFragment != null) return@post
+            if (isFinishing || isDestroyed) return@post
+            try {
+                val frag = CameraBridgeFragment.newInstance().apply {
+                    callbacks = this@MainActivity
+                }
+                cameraFragment = frag
+                supportFragmentManager.beginTransaction()
+                    .replace(binding.previewHost.id, frag)
+                    .commitAllowingStateLoss()
             } catch (t: Throwable) {
-                Log.w(TAG, "getConnection() failed", t)
-                null
-            } ?: return null
-
-            val raw = try { conn.rawDescriptors } catch (t: Throwable) { null }
-            if (raw == null || raw.size < 12) {
-                Log.w(TAG, "rawDescriptors unavailable")
-                return null
+                cameraFragment = null
+                binding.scanHint.text =
+                    "Scanner engine failed to start."
+                toast("Scanner init failed")
             }
+        }
+    }
 
-            var vcIf = -1
-            var ctId = -1
-            var puId = -1
-            var inVc = false
-            var i = 0
-            while (i + 1 < raw.size) {
-                val len = raw[i].toInt() and 0xFF
-                if (len < 2 || i + len > raw.size) break
-                val type = raw[i + 1].toInt() and 0xFF
-                when (type) {
-                    0x04 -> { // standard INTERFACE descriptor
-                        val ifNum = raw[i + 2].toInt() and 0xFF
-                        val klass = raw[i + 5].toInt() and 0xFF
-                        val sub = raw[i + 6].toInt() and 0xFF
-                        inVc = (klass == 0x0E && sub == 0x01) // Video / VideoControl
-                        if (inVc) vcIf = ifNum
-                    }
-                    0x24 -> if (inVc && len >= 4) { // class-specific VC descriptor
-                        when (raw[i + 2].toInt() and 0xFF) { // subtype
-                            0x02 -> if (ctId < 0) ctId = raw[i + 3].toInt() and 0xFF // INPUT_TERMINAL
-                            0x05 -> if (puId < 0) puId = raw[i + 3].toInt() and 0xFF // PROCESSING_UNIT
-                        }
-                    }
+    // ---------------- scan control ----------------
+    private val qrScanLauncher = registerForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            val text = result.data?.getStringExtra(QrScanActivity.EXTRA_QR)
+            if (!text.isNullOrBlank()) handleScannedQr(text)
+        }
+    }
+
+    private fun toggleScanning() {
+        if (streaming) { toast("Already paired and streaming"); return }
+        qrScanLauncher.launch(android.content.Intent(this, QrScanActivity::class.java))
+    }
+
+    private fun handleScannedQr(text: String) {
+        val target = PairingClient.parsePcQr(text) ?: run {
+            toast("That QR isn't a Scanner Pro pairing code.")
+            return
+        }
+        binding.scanHint.text = "Code read \u2014 connecting to PC..."
+        updateUi()
+        pairWithPc(target)
+    }
+
+    private fun pairWithPc(target: PairingClient.PcTarget) {
+        val phoneIp = NetworkUtils.getLocalIpAddress()
+        if (phoneIp == null) {
+            runOnUiThread { toast("No Wi-Fi. Join the same network as the PC.") }
+            return
+        }
+
+        startStreaming(phoneIp)
+
+        thread {
+            val name = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
+            val ok = PairingClient.sendAddress(
+                target = target,
+                phoneIp = phoneIp,
+                streamPort = streamPort,
+                deviceName = name
+            )
+            runOnUiThread {
+                if (ok) {
+                    pairedPcName = target.ip
+                    binding.scanHint.text = "Paired. The PC is now receiving your scanner."
+                    toast("Paired with PC")
+                } else {
+                    binding.scanHint.text =
+                        "Couldn't reach the PC gate. Same Wi-Fi? Try again."
+                    toast("Pairing callback failed")
                 }
-                i += len
-            }
-
-            // Fail-safe: if descriptor parsing came up short, fall back to the
-            // layout used by virtually every consumer webcam (VideoControl on
-            // interface 0, Camera Terminal id 1, Processing Unit id 2), so
-            // controls keep working without any debugging.
-            if (vcIf < 0) vcIf = 0
-            if (ctId < 0) ctId = 1
-            if (puId < 0) puId = 2
-            Log.d(TAG, "ready: vcInterface=$vcIf cameraTerminal=$ctId processingUnit=$puId")
-            return UvcDirectControls(conn, vcIf, ctId, puId)
-        }
-
-        /**
-         * Just the raw UsbDeviceConnection AUSBC opened, independent of
-         * whether direct controls are usable. The watchdog needs this to
-         * abort a control transfer wedged inside libuvc (closing the fd is
-         * the only thing that unblocks an infinite-timeout transfer).
-         */
-        fun connectionFrom(cam: MultiCameraClient.ICamera?): UsbDeviceConnection? {
-            cam ?: return null
-            val ctrlBlock = readField(cam, "mCtrlBlock") ?: return null
-            return try {
-                ctrlBlock.javaClass.getMethod("getConnection")
-                    .invoke(ctrlBlock) as? UsbDeviceConnection
-            } catch (_: Throwable) {
-                null
+                updateUi()
             }
         }
+    }
 
-        private fun readField(obj: Any, name: String): Any? {
-            var c: Class<*>? = obj.javaClass
-            while (c != null) {
+    // ---------------- streaming ----------------
+    private fun startStreaming(phoneIp: String) {
+        if (streaming) return
+        val srv = MjpegServer(streamPort).apply { listener = this@MainActivity }
+        val bridge = FrameBridge(srv)
+        server = srv
+        frameBridge = bridge
+        cameraFragment?.frameBridge = bridge
+        srv.start()
+        streaming = true
+
+        val url = NetworkUtils.buildStreamUrl(phoneIp, streamPort)
+        try {
+            val svc = Intent(this, StreamForegroundService::class.java)
+                .putExtra(StreamForegroundService.EXTRA_URL, url)
+            ContextCompat.startForegroundService(this, svc)
+        } catch (t: Throwable) {
+            runOnUiThread { binding.scanHint.text =
+                "Streaming (note: background keep-alive unavailable on this OS)." }
+        }
+
+        runOnUiThread {
+            updateUi()
+        }
+    }
+
+    private fun stopEverything() {
+        scanning = false
+        cameraFragment?.frameBridge = null
+        server?.stop()
+        server = null
+        frameBridge = null
+        streaming = false
+        pairedPcName = ""
+        stopService(Intent(this, StreamForegroundService::class.java))
+        binding.scanHint.text = "Tap Scan PC Code, then aim the phone camera at the QR code."
+        updateUi()
+        toast("Stopped")
+    }
+
+    // ---------------- UI ----------------
+    private fun updateUi() {
+        binding.actionButton.text = when {
+            streaming -> "Paired \u2713"
+            scanning -> "Scanning... (tap to stop)"
+            else -> "Scan PC Code"
+        }
+        binding.actionButton.isEnabled = !streaming
+        binding.stopButton.visibility = if (streaming || scanning) View.VISIBLE else View.GONE
+
+        val online = streaming
+        binding.statusDot.setBackgroundResource(
+            if (online) R.drawable.dot_online else R.drawable.dot_offline)
+        binding.statusText.text = when {
+            streaming -> "Streaming"
+            scanning -> "Scanning"
+            cameraReady -> "Scanner ready"
+            else -> "No scanner"
+        }
+    }
+
+    private fun startStatsTicker() {
+        ui.postDelayed(object : Runnable {
+            override fun run() {
+                val fps = frameBridge?.fpsCounter?.fps ?: 0
+                binding.fpsBadge.text = "$fps fps"
+                checkControlWatchdog()
+                ui.postDelayed(this, 1000)
+            }
+        }, 1000)
+    }
+
+    // ---------------- scanner controls (HandlerThread) ----------------
+    @Volatile private var applyingRemote = false
+
+    private val pendingControls = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    // Last value actually written to the camera per control. Skipping
+    // redundant writes keeps USB EP0 traffic to a minimum — flooding the
+    // control endpoint is what wedges cheap UVC firmware.
+    private val lastApplied = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    // Watchdog: timestamp set just before a JNI control write starts, cleared
+    // when it returns. libuvc in this build uses an INFINITE control-transfer
+    // timeout, so if the webcam ever stalls a request, the write never
+    // returns and this thread is wedged forever. The watchdog detects that
+    // and recovers (see checkControlWatchdog).
+    @Volatile private var controlBusySince = 0L
+    @Volatile private var recovering = false
+
+    // Dedicated background thread to run USB control JNI tasks safely.
+    // var (not val): the watchdog abandons a wedged thread and replaces it.
+    private var controlThread = android.os.HandlerThread("ScannerControlThread").apply { start() }
+    private var controlHandler = Handler(controlThread.looper)
+
+    private val writePendingControlsRunnable = object : Runnable {
+        override fun run() {
+            val names = ArrayList(pendingControls.keys)
+            for (n in names) {
+                val v = pendingControls.remove(n) ?: continue
+                if (lastApplied[n] == v) continue // no change -> no USB traffic
+                controlBusySince = System.currentTimeMillis()
                 try {
-                    val f = c.getDeclaredField(name)
-                    f.isAccessible = true
-                    return f.get(obj)
-                } catch (_: NoSuchFieldException) {
+                    applyControlToCamera(n, v)
+                    lastApplied[n] = v
+                    Thread.sleep(50) // pace EP0 writes; bursts wedge cheap firmware
+                } catch (_: Throwable) {
+                } finally {
+                    controlBusySince = 0L
                 }
-                c = c.superclass
             }
-            return null
         }
     }
 
-    /** Optional sink for human-readable error messages (shown in the app UI). */
-    @Volatile var diagSink: ((String) -> Unit)? = null
-
-    // Cached (min, max) per (entity, selector); queried once with timeout.
-    private val ranges = java.util.concurrent.ConcurrentHashMap<Int, Pair<Int, Int>>()
-    @Volatile private var aeManualSet = false
-
-    // Tracks whether we already forced auto-WB off, so a wb_temp slider drag
-    // sends ONE transfer per tick instead of two. Cheap UVC firmware wedges
-    // its control endpoint when EP0 is flooded while streaming; halving the
-    // traffic on the hottest control matters.
-    @Volatile private var wbAutoOffSent = false
-
-    // All EP0 control transfers are serialized. Two overlapping control
-    // transfers on the same device fd (e.g. old + replacement control thread
-    // during a recovery) is a classic way to stall cheap webcam firmware.
-    private val transferLock = Any()
-
-    // ---- raw transfer helpers ---------------------------------------------
-
-    private fun setCur(entity: Int, cs: Int, value: Int, size: Int): Boolean {
-        val buf = ByteArray(size)
-        for (b in 0 until size) buf[b] = ((value shr (8 * b)) and 0xFF).toByte()
-        val r = synchronized(transferLock) {
-            conn.controlTransfer(
-                REQ_SET, SET_CUR, cs shl 8, (entity shl 8) or vcInterface, buf, size, TIMEOUT_MS
-            )
-        }
-        if (r < 0) {
-            Log.w(TAG, "SET_CUR entity=$entity cs=0x${cs.toString(16)} val=$value FAILED ($r)")
-            diagSink?.invoke("USB write failed: cs=0x${cs.toString(16)} r=$r")
-        }
-        return r >= 0
-    }
-
-    private fun getReq(req: Int, entity: Int, cs: Int, size: Int): Int? {
-        val buf = ByteArray(size)
-        val r = synchronized(transferLock) {
-            conn.controlTransfer(
-                REQ_GET, req, cs shl 8, (entity shl 8) or vcInterface, buf, size, TIMEOUT_MS
-            )
-        }
-        if (r < 0) return null
-        var v = 0
-        for (b in 0 until size) v = v or ((buf[b].toInt() and 0xFF) shl (8 * b))
-        // sign-extend 2-byte values (brightness etc. can be negative)
-        if (size == 2 && (v and 0x8000) != 0) v = v or -0x10000
-        return v
-    }
-
-    private fun rangeOf(entity: Int, cs: Int, size: Int, defMin: Int, defMax: Int): Pair<Int, Int> {
-        val key = (entity shl 16) or cs
-        ranges[key]?.let { return it }
-        val min = getReq(GET_MIN, entity, cs, size)
-        val max = getReq(GET_MAX, entity, cs, size)
-        val pair = if (min != null && max != null && max > min) min to max else defMin to defMax
-        ranges[key] = pair
-        Log.d(TAG, "range entity=$entity cs=0x${cs.toString(16)}: ${pair.first}..${pair.second}")
-        return pair
-    }
-
-    private fun scale(percent: Int, range: Pair<Int, Int>): Int {
-        val p = percent.coerceIn(0, 100)
-        return range.first + p * (range.second - range.first) / 100
+    private fun enqueueControl(name: String, value: Int) {
+        pendingControls[name] = value
+        controlHandler.removeCallbacks(writePendingControlsRunnable)
+        // Debounce & throttle writes sequentially. 100 ms (was 30) — during a
+        // slider drag only the newest value per control survives, cutting
+        // control-endpoint traffic to <=10 writes/sec per control.
+        controlHandler.postDelayed(writePendingControlsRunnable, 100)
     }
 
     /**
-     * One-shot health check, run at camera-open BEFORE this path is trusted.
-     * Some devices never answer class-specific requests sent through
-     * UsbDeviceConnection while libusb owns the interface; on those, every
-     * later SET would fail and controls would silently do nothing. A cheap
-     * GET_CUR (brightness on the PU, zoom on the CT as backup) tells us
-     * up-front whether this path is real on this hardware.
+     * Called once a second from the stats ticker. If a control write has been
+     * stuck inside JNI for >4 s, the webcam has stalled the USB control
+     * endpoint and that HandlerThread will never come back on its own.
+     * Recovery: abandon the wedged thread, spin up a fresh one, and
+     * close/reopen the camera — closing the device handle aborts the pending
+     * libusb transfer, which also lets the old thread finally exit.
      */
-    fun probe(): Boolean {
-        if (getReq(GET_CUR, processingUnitId, PU_BRIGHTNESS, 2) != null) return true
-        if (getReq(GET_CUR, cameraTerminalId, CT_ZOOM_ABS, 2) != null) return true
-        // one retry — first EP0 request right after stream start often NAKs
-        Thread.sleep(150)
-        val ok = getReq(GET_CUR, processingUnitId, PU_BRIGHTNESS, 2) != null
-        Log.i(TAG, "probe: direct control path ${if (ok) "OK" else "NOT available on this device"}")
-        if (!ok) diagSink?.invoke("Direct USB path not answering (probe failed)")
-        return ok
+    private fun checkControlWatchdog() {
+        val since = controlBusySince
+        if (since == 0L || recovering) return
+        if (System.currentTimeMillis() - since < 4000) return
+
+        recovering = true
+        controlBusySince = 0L
+        toast("Scanner controls stalled — resetting…")
+        onControlDiag("Control write stalled >4 s \u2014 forcing scanner reset", true)
+
+        try { controlThread.quitSafely() } catch (_: Throwable) {}
+        controlThread = android.os.HandlerThread("ScannerControlThread-r").apply { start() }
+        controlHandler = Handler(controlThread.looper)
+        pendingControls.clear()
+        lastApplied.clear()
+
+        // Order matters: closing the raw USB fd aborts the control transfer
+        // wedged inside libuvc (its timeout is infinite) and releases the
+        // UVCCamera monitor the wedged thread holds. Only AFTER that can
+        // closeCamera()/openCamera() actually run — calling them first just
+        // queued them behind the dead monitor forever, which is why the old
+        // recovery never brought controls back.
+        cameraFragment?.ctlAbortStuckControl()
+        cameraFragment?.ctlRecoverCamera()
+
+        // Allow another recovery attempt after things settle.
+        ui.postDelayed({ recovering = false }, 5000)
     }
 
-    // ---- public control API (all percent 0..100) ---------------------------
+    // ---------------- on-screen control diagnostics ----------------
+    // No Logcat needed: the latest control-path event is shown as a small
+    // status line at the top of Scanner Controls, errors also pop a toast
+    // (throttled), and TAPPING the status line copies the full diagnostic
+    // history to the clipboard so it can be pasted into a chat/bug report.
+    private var diagView: android.widget.TextView? = null
+    private val diagLog = ArrayDeque<String>()
+    private var lastDiagToastAt = 0L
 
-    fun setPu(cs: Int, percent: Int, defMin: Int = 0, defMax: Int = 255): Boolean {
-        if (processingUnitId < 0) return false
-        val range = rangeOf(processingUnitId, cs, 2, defMin, defMax)
-        return setCur(processingUnitId, cs, scale(percent, range), 2)
-    }
-
-    fun setAutoWhiteBalance(on: Boolean): Boolean {
-        if (processingUnitId < 0) return false
-        val ok = setCur(processingUnitId, PU_WB_TEMP_AUTO, if (on) 1 else 0, 1)
-        if (ok) wbAutoOffSent = !on
-        return ok
-    }
-
-    fun setWbTempPercent(percent: Int): Boolean {
-        if (processingUnitId < 0) return false
-        // Manual temp requires auto-WB off — but send that byte only once,
-        // not on every slider tick.
-        if (!wbAutoOffSent) {
-            if (setCur(processingUnitId, PU_WB_TEMP_AUTO, 0, 1)) wbAutoOffSent = true
+    private fun setupDiagView() {
+        val tv = android.widget.TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.parseColor("#9aa7b5"))
+            text = "Control path: waiting for scanner\u2026"
+            setPadding(0, 0, 0, (10 * resources.displayMetrics.density).toInt())
+            setOnClickListener {
+                if (diagLog.isEmpty()) return@setOnClickListener
+                val cb = getSystemService(Context.CLIPBOARD_SERVICE)
+                        as android.content.ClipboardManager
+                cb.setPrimaryClip(android.content.ClipData.newPlainText(
+                    "scanner-diag", diagLog.joinToString("\n")))
+                toast("Diagnostics copied \u2014 paste anywhere")
+            }
         }
-        val range = rangeOf(processingUnitId, PU_WB_TEMP, 2, 2800, 6500)
-        return setCur(processingUnitId, PU_WB_TEMP, scale(percent, range), 2)
+        binding.controlsBody.addView(tv, 0)
+        diagView = tv
     }
 
-    fun setZoomPercent(percent: Int): Boolean {
-        if (cameraTerminalId < 0) return false
-        val range = rangeOf(cameraTerminalId, CT_ZOOM_ABS, 2, 100, 400)
-        return setCur(cameraTerminalId, CT_ZOOM_ABS, scale(percent, range), 2)
-    }
-
-    fun setExposurePercent(percent: Int): Boolean {
-        if (cameraTerminalId < 0) return false
-        if (!aeManualSet) {
-            // AE mode bitmap: 1=manual, 2=auto, 4=shutter prio, 8=aperture prio
-            val ok = setCur(cameraTerminalId, CT_AE_MODE, 1, 1)
-            if (!ok) setCur(cameraTerminalId, CT_AE_MODE, 4, 1) // shutter-prio fallback
-            aeManualSet = true
+    override fun onControlDiag(message: String, isError: Boolean) {
+        val ts = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+            .format(java.util.Date())
+        synchronized(diagLog) {
+            diagLog.addLast("[$ts] $message")
+            while (diagLog.size > 60) diagLog.removeFirst()
         }
-        val range = rangeOf(cameraTerminalId, CT_EXPOSURE_TIME_ABS, 4, 1, 5000)
-        return setCur(cameraTerminalId, CT_EXPOSURE_TIME_ABS, scale(percent, range), 4)
+        runOnUiThread {
+            diagView?.apply {
+                text = "$message  (tap to copy log)"
+                setTextColor(Color.parseColor(if (isError) "#ff7a7a" else "#9aa7b5"))
+            }
+            if (isError) {
+                val now = System.currentTimeMillis()
+                if (now - lastDiagToastAt > 5000) {
+                    lastDiagToastAt = now
+                    toast("Scanner: $message")
+                }
+            }
+        }
+    }
+
+    private fun setupCameraControls() {
+        setupDiagView()
+        binding.controlsHeader.setOnClickListener {
+            val body = binding.controlsBody
+            val showing = body.visibility == View.VISIBLE
+            body.visibility = if (showing) View.GONE else View.VISIBLE
+            binding.controlsToggle.text = if (showing) "Show" else "Hide"
+        }
+
+        // Dual-Controls Synchronization Architecture
+        bindSeekBarPair(binding.sbBrightness, binding.fsSbBrightness, "brightness")
+        bindSeekBarPair(binding.sbExposure,   binding.fsSbExposure,   "exposure")
+        bindSeekBarPair(binding.sbContrast,   binding.fsSbContrast,   "contrast")
+        bindSeekBarPair(binding.sbSaturation, binding.fsSbSaturation, "saturation")
+        bindSeekBarPair(binding.sbGain,       binding.fsSbGain,       "gain")
+        bindSeekBarPair(binding.sbSharpness,  binding.fsSbSharpness,  "sharpness")
+        bindSeekBarPair(binding.sbZoom,       binding.fsSbZoom,       "zoom")
+        bindSeekBarPair(binding.sbWbTemp,     binding.fsSbWbTemp,     "wb_temp")
+
+        val autoWbListener = android.widget.CompoundButton.OnCheckedChangeListener { buttonView, checked ->
+            if (applyingRemote) return@OnCheckedChangeListener
+            val other = if (buttonView == binding.cbAutoWb) binding.fsCbAutoWb else binding.cbAutoWb
+            if (other.isChecked != checked) {
+                other.isChecked = checked
+            }
+            enqueueControl("auto_wb", if (checked) 100 else 0)
+            server?.controlState?.applyOne("auto_wb", if (checked) 100 else 0, "ui")
+        }
+        binding.cbAutoWb.setOnCheckedChangeListener(autoWbListener)
+        binding.fsCbAutoWb.setOnCheckedChangeListener(autoWbListener)
+    }
+
+    private fun bindSeekBarPair(sbNormal: android.widget.SeekBar, sbFs: android.widget.SeekBar, name: String) {
+        val listener = object : android.widget.SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: android.widget.SeekBar?, value: Int, fromUser: Boolean) {
+                if (!fromUser || applyingRemote) return
+                
+                // Mirror progress to the matching layout slider
+                val other = if (s == sbNormal) sbFs else sbNormal
+                other.progress = value
+                
+                // Toggle Auto WB off on manual temperature changes
+                if (name == "wb_temp") {
+                    if (binding.cbAutoWb.isChecked) binding.cbAutoWb.isChecked = false
+                    if (binding.fsCbAutoWb.isChecked) binding.fsCbAutoWb.isChecked = false
+                    enqueueControl("auto_wb", 0)
+                    server?.controlState?.applyOne("auto_wb", 0, "ui")
+                }
+                
+                enqueueControl(name, value)
+                server?.controlState?.applyOne(name, value, "ui")
+            }
+            override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
+            override fun onStopTrackingTouch(s: android.widget.SeekBar?) {}
+        }
+        sbNormal.setOnSeekBarChangeListener(listener)
+        sbFs.setOnSeekBarChangeListener(listener)
+    }
+
+    private fun applyControlToCamera(name: String, value: Int) {
+        val frag = cameraFragment ?: return
+        when (name) {
+            "brightness" -> frag.ctlSetBrightness(value)
+            "exposure"   -> frag.ctlSetExposure(value)
+            "contrast"   -> frag.ctlSetContrast(value)
+            "saturation" -> frag.ctlSetSaturation(value)
+            "gain"       -> frag.ctlSetGain(value)
+            "sharpness"  -> frag.ctlSetSharpness(value)
+            "zoom"       -> frag.ctlSetZoom(value)
+            "wb_temp"    -> frag.ctlSetWbTemp(value)
+            "auto_wb"    -> frag.ctlSetAutoWhiteBalance(value >= 50)
+        }
+    }
+
+    override fun onControlsChanged(changed: List<String>, source: String) {
+        val cs = server?.controlState ?: return
+        runOnUiThread {
+            applyingRemote = true
+            try {
+                for (name in changed) {
+                    val v = when (name) {
+                        "brightness" -> cs.brightness
+                        "exposure"   -> cs.exposure
+                        "contrast"   -> cs.contrast
+                        "saturation" -> cs.saturation
+                        "gain"       -> cs.gain
+                        "sharpness"  -> cs.sharpness
+                        "zoom"       -> cs.zoom
+                        "wb_temp"    -> cs.wbTemp
+                        "auto_wb"    -> if (cs.autoWb) 100 else 0
+                        else -> continue
+                    }
+                    enqueueControl(name, v)
+                    
+                    // Update portrait and fullscreen SeekBars simultaneously
+                    when (name) {
+                        "brightness" -> {
+                            binding.sbBrightness.progress = v
+                            binding.fsSbBrightness.progress = v
+                        }
+                        "exposure"   -> {
+                            binding.sbExposure.progress = v
+                            binding.fsSbExposure.progress = v
+                        }
+                        "contrast"   -> {
+                            binding.sbContrast.progress = v
+                            binding.fsSbContrast.progress = v
+                        }
+                        "saturation" -> {
+                            binding.sbSaturation.progress = v
+                            binding.fsSbSaturation.progress = v
+                        }
+                        "gain"       -> {
+                            binding.sbGain.progress = v
+                            binding.fsSbGain.progress = v
+                        }
+                        "sharpness"  -> {
+                            binding.sbSharpness.progress = v
+                            binding.fsSbSharpness.progress = v
+                        }
+                        "zoom"       -> {
+                            binding.sbZoom.progress = v
+                            binding.fsSbZoom.progress = v
+                        }
+                        "wb_temp"    -> {
+                            binding.sbWbTemp.progress = v
+                            binding.fsSbWbTemp.progress = v
+                        }
+                        "auto_wb"    -> binding.cbAutoWb.isChecked = (v >= 50)
+                    }
+                }
+            } finally {
+                applyingRemote = false
+            }
+        }
+    }
+
+    private fun applyInitialCameraControls() {
+        // Delay well past stream startup: libusb issues its own control
+        // traffic while the stream spins up, and mixing our writes into that
+        // window is what wedges this camera's firmware.
+        ui.postDelayed({ applyInitialCameraControlsNow() }, 1500)
+    }
+
+    private fun applyInitialCameraControlsNow() {
+        runOnUiThread {
+            val values = linkedMapOf(
+                "auto_wb" to (if (binding.cbAutoWb.isChecked) 100 else 0),
+                "brightness" to binding.sbBrightness.progress,
+                "exposure" to binding.sbExposure.progress,
+                "contrast" to binding.sbContrast.progress,
+                "saturation" to binding.sbSaturation.progress,
+                "gain" to binding.sbGain.progress,
+                "sharpness" to binding.sbSharpness.progress,
+                "zoom" to binding.sbZoom.progress,
+                "wb_temp" to binding.sbWbTemp.progress,
+            )
+            server?.controlState?.let { cs ->
+                for ((k, v) in values) cs.applyOne(k, v, "ui")
+            }
+            for ((k, v) in values) enqueueControl(k, v)
+        }
+    }
+
+    // ---------------- fullscreen / landscape ----------------
+    private var isFullscreen = false
+    private var savedHostHeight = -1
+    private var savedScrollY = 0
+
+    private fun setupFullscreen() {
+        binding.fullscreenButton.setOnClickListener { enterFullscreen() }
+        binding.fsExitButton.setOnClickListener { exitFullscreen() }
+        binding.fsToggleControlsButton.setOnClickListener { toggleFullscreenControls() }
+    }
+
+    private fun enterFullscreen() {
+        if (isFullscreen) return
+        isFullscreen = true
+
+        requestedOrientation =
+            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        hideSystemBars(true)
+
+        savedScrollY = binding.contentScroll.scrollY
+        savedHostHeight = binding.previewHost.layoutParams.height
+
+        setSiblingCardsVisible(View.GONE)
+        binding.previewHeaderRow.visibility = View.GONE
+        binding.previewCard.setPadding(0, 0, 0, 0)
+        (binding.previewCard.layoutParams as? ViewGroup.MarginLayoutParams)?.let {
+            it.topMargin = 0; binding.previewCard.layoutParams = it
+        }
+        binding.previewCard.background = null
+
+        val fillH = binding.rootContainer.height.takeIf { it > 0 }
+            ?: resources.displayMetrics.heightPixels
+        binding.previewCard.layoutParams = binding.previewCard.layoutParams.apply {
+            height = fillH
+        }
+        binding.previewCardInner.layoutParams = binding.previewCardInner.layoutParams.apply {
+            height = ViewGroup.LayoutParams.MATCH_PARENT
+        }
+        binding.previewHost.layoutParams = binding.previewHost.layoutParams.apply {
+            height = ViewGroup.LayoutParams.MATCH_PARENT
+        }
+        binding.rootContainer.post {
+            if (isFullscreen) {
+                val h = binding.rootContainer.height.takeIf { it > 0 }
+                    ?: resources.displayMetrics.heightPixels
+                binding.previewCard.layoutParams = binding.previewCard.layoutParams.apply {
+                    height = h
+                }
+            }
+        }
+
+        binding.contentScroll.scrollTo(0, 0)
+        binding.fullscreenOverlay.visibility = View.VISIBLE
+
+        binding.fsControlsScroll.visibility = View.GONE
+        binding.fsToggleControlsButton.text = "Controls"
+    }
+
+    private fun exitFullscreen() {
+        if (!isFullscreen) return
+        isFullscreen = false
+
+        requestedOrientation =
+            android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        hideSystemBars(false)
+
+        binding.fullscreenOverlay.visibility = View.GONE
+
+        setSiblingCardsVisible(View.VISIBLE)
+        binding.previewHeaderRow.visibility = View.VISIBLE
+        val pad = (12 * resources.displayMetrics.density).toInt()
+        binding.previewCard.setPadding(pad, pad, pad, pad)
+        (binding.previewCard.layoutParams as? ViewGroup.MarginLayoutParams)?.let {
+            it.topMargin = (14 * resources.displayMetrics.density).toInt()
+            binding.previewCard.layoutParams = it
+        }
+        binding.previewCard.setBackgroundResource(R.drawable.card_panel)
+
+        binding.previewCard.layoutParams = binding.previewCard.layoutParams.apply {
+            height = ViewGroup.LayoutParams.WRAP_CONTENT
+        }
+        binding.previewCardInner.layoutParams = binding.previewCardInner.layoutParams.apply {
+            height = ViewGroup.LayoutParams.WRAP_CONTENT
+        }
+        binding.previewHost.layoutParams = binding.previewHost.layoutParams.apply {
+            height = if (savedHostHeight > 0) savedHostHeight
+                     else (240 * resources.displayMetrics.density).toInt()
+        }
+
+        binding.contentScroll.post { binding.contentScroll.scrollTo(0, savedScrollY) }
+    }
+
+    private fun setSiblingCardsVisible(visibility: Int) {
+        val scrollContent = binding.contentScroll.getChildAt(0) as? ViewGroup ?: return
+        for (i in 0 until scrollContent.childCount) {
+            val child = scrollContent.getChildAt(i)
+            if (child.id != binding.previewCard.id) {
+                child.visibility = visibility
+            }
+        }
+    }
+
+    private fun toggleFullscreenControls() {
+        val panel = binding.fsControlsScroll
+        val showing = panel.visibility == View.VISIBLE
+        panel.visibility = if (showing) View.GONE else View.VISIBLE
+        binding.fsToggleControlsButton.text = if (showing) "Controls" else "Hide"
+    }
+
+    private fun hideSystemBars(hide: Boolean) {
+        val controller = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
+        if (hide) {
+            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+            controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            controller.systemBarsBehavior =
+                androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else {
+            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, true)
+            controller.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    override fun onBackPressed() {
+        if (isFullscreen) {
+            exitFullscreen()
+            return
+        }
+        super.onBackPressed()
+    }
+
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+
+    // ---------------- camera callbacks ----------------
+    override fun onCameraOpened(width: Int, height: Int) {
+        cameraReady = true
+        lastApplied.clear() // fresh device state -> re-send everything
+        if (frameBridge != null) {
+            cameraFragment?.frameBridge = frameBridge
+        }
+        applyInitialCameraControls()
+        runOnUiThread {
+            binding.previewPlaceholder.visibility = View.GONE
+            updateUi()
+        }
+    }
+
+    override fun onCameraClosed() {
+        cameraReady = false
+        runOnUiThread {
+            binding.previewPlaceholder.visibility = View.VISIBLE
+            updateUi()
+        }
+    }
+
+    // ---------------- server callbacks ----------------
+    override fun onClientCountChanged(count: Int) {
+        // Stats displays removed
+    }
+
+    override fun onServerError(message: String) {
+        runOnUiThread { toast("Server error: $message") }
+    }
+
+    override fun onDestroy() {
+        if (streaming || scanning) stopEverything()
+        try {
+            controlThread.quitSafely()
+        } catch (_: Throwable) {
+            try { controlThread.quit() } catch (_: Throwable) {}
+        }
+        super.onDestroy()
     }
 }
