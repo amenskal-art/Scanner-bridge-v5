@@ -30,17 +30,23 @@ class CameraBridgeFragment : CameraFragment() {
     // Throttle diag spam: at most one error message per 2 s reaches the UI,
     // and an identical info message repeated within 2 s is dropped (duplicate
     // OPENED events after a USB reset used to print "controls ready" 3-4x).
+    // force=true bypasses BOTH throttles — used for control-path state
+    // changes, which the round-5 field log proved can land inside the 2 s
+    // window of an ordinary write-failure message and vanish, hiding the
+    // most important line in the whole log.
     @Volatile private var lastDiagErrAt = 0L
     @Volatile private var lastDiagMsg = ""
     @Volatile private var lastDiagMsgAt = 0L
-    private fun diag(msg: String, err: Boolean = false) {
+    private fun diag(msg: String, err: Boolean = false, force: Boolean = false) {
         val now = System.currentTimeMillis()
-        if (err) {
-            if (now - lastDiagErrAt < 2000) return
-            lastDiagErrAt = now
-        } else {
-            if (msg == lastDiagMsg && now - lastDiagMsgAt < 2000) return
+        if (!force) {
+            if (err) {
+                if (now - lastDiagErrAt < 2000) return
+            } else {
+                if (msg == lastDiagMsg && now - lastDiagMsgAt < 2000) return
+            }
         }
+        if (err) lastDiagErrAt = now
         lastDiagMsg = msg
         lastDiagMsgAt = now
         try { callbacks?.onControlDiag(msg, err) } catch (_: Throwable) {}
@@ -439,15 +445,30 @@ class CameraBridgeFragment : CameraFragment() {
 
     private fun directResult(ok: Boolean) {
         if (ok) {
-            directEverOk = true
+            if (!directEverOk) {
+                directEverOk = true
+                // One-time confirmation, with the camera's ACTUAL answer
+                // time — this number tells us how close to the timeout this
+                // device runs under load, without needing Logcat.
+                val ms = direct?.lastSetMs ?: -1
+                diag("Direct controls OK (answered in $ms ms)", err = false, force = true)
+            }
             directFailStreak = 0
             directFirstUseFails = 0
             return
         }
         if (!directEverOk) {
-            if (++directFirstUseFails >= 3) {
+            // With the 4 s timeout + retry, one failed SET means the camera
+            // didn't answer for ~8.4 s. Five of those in a row (~40 s of
+            // silence) is real evidence the app-level path doesn't work on
+            // this device — the previous threshold of 3 with a 1.5 s timeout
+            // tripped on a merely SLOW camera and dumped us onto libuvc,
+            // whose infinite-timeout write then wedged and triggered the
+            // reset. This message is forced past the diag throttle: in the
+            // round-5 log it was swallowed and the fallback was invisible.
+            if (++directFirstUseFails >= 5) {
                 Log.w("CameraBridge", "direct path never answered — falling back to libuvc for this session")
-                diag("Direct USB path not answering \u2014 using library path", true)
+                diag("Direct USB path not answering \u2014 switching to library path", err = true, force = true)
                 direct = null
             }
             return
