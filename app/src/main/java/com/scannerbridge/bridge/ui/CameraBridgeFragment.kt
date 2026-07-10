@@ -1,7 +1,5 @@
 package com.scannerbridge.bridge.ui
 
-import android.os.Handler
-import android.os.Looper
 import android.util.Log
 import android.view.LayoutInflater
 import android.view.View
@@ -44,9 +42,13 @@ class CameraBridgeFragment : CameraFragment() {
     @Volatile var frameBridge: FrameBridge? = null
 
     // Direct UVC control path (Android controlTransfer with real timeouts).
+    // ALL controls go through this; libuvc's synchronized control methods are
+    // never called after open, so a camera stall can no longer deadlock the
+    // UVCCamera monitor and freeze the app.
     @Volatile private var direct: UvcDirectControls? = null
 
-    // Raw USB connection AUSBC opened
+    // Raw USB connection AUSBC opened — kept so the watchdog can close() it
+    // to abort a control transfer wedged inside libuvc's infinite timeout.
     @Volatile private var usbConn: android.hardware.usb.UsbDeviceConnection? = null
 
     private var binding: FragmentCameraBinding? = null
@@ -57,9 +59,10 @@ class CameraBridgeFragment : CameraFragment() {
     @Volatile private var frameW = reqWidth
     @Volatile private var frameH = reqHeight
 
+    // Leave true until exposure is confirmed working. It only dumps once per
+    // camera-open and is harmless in production, but you can flip to false
+    // once ctlSetExposure is confirmed working.
     private val DEBUG_EXPOSURE = true
-
-    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun getRootView(inflater: LayoutInflater, container: ViewGroup?): View {
         val b = FragmentCameraBinding.inflate(inflater, container, false)
@@ -127,21 +130,25 @@ class CameraBridgeFragment : CameraFragment() {
                 expInited = false
                 directFailStreak = 0
                 usbConn = UvcDirectControls.connectionFrom(getCurrentCamera())
-                
-                // Initialize direct controls after a delay to avoid interfering 
-                // with the camera's stream negotiation on EP0.
+                // DO NOT touch EP0 here — no probing, no direct-path setup.
+                // Field test showed that sending raw control transfers while
+                // libusb is negotiating stream startup wedges this camera's
+                // firmware for the whole session (every later control write
+                // then stalls). Controls use the libuvc path exclusively,
+                // protected by the watchdog + real USB reset.
                 direct = null
-                diag("Scanner connected \u2014 starting controls\u2026")
-                initDirectControlsWithDelay()
-
+                Log.i("CameraBridge", "control path: LIBUVC (direct disabled)")
+                diag("Scanner connected \u2014 controls ready")
                 resolveActualPreviewSize()
                 frameBridge?.setResolution(frameW, frameH)
                 try {
                     addPreviewDataCallBack(previewCallback)
-                } catch (_: Throwable) {}
+                } catch (_: Throwable) {
+                }
                 try {
                     binding?.cameraRender?.setAspectRatio(frameW, frameH)
-                } catch (_: Throwable) {}
+                } catch (_: Throwable) {
+                }
                 if (DEBUG_EXPOSURE) {
                     dumpExposureSurface()
                 }
@@ -162,50 +169,37 @@ class CameraBridgeFragment : CameraFragment() {
         }
     }
 
-    private fun initDirectControlsWithDelay() {
-        val delayMs = 1200L
-        mainHandler.postDelayed({
-            if (isDetached || context == null || usbConn == null) {
-                diag("Scanner control initialization skipped")
-                return@postDelayed
-            }
-            val cam = getCurrentCamera()
-            if (cam == null) {
-                diag("Scanner control initialization skipped: camera closed")
-                return@postDelayed
-            }
-            try {
-                val d = UvcDirectControls.from(cam)
-                if (d != null) {
-                    d.diagSink = { msg -> diag(msg, false) }
-                    if (d.probe()) {
-                        direct = d
-                        diag("Scanner connected \u2014 controls ready (Direct Path)")
-                        Log.i("CameraBridge", "Control path successfully initialized: DIRECT")
-                        return@postDelayed
-                    }
-                }
-            } catch (t: Throwable) {
-                Log.e("CameraBridge", "Failed to init direct controls", t)
-            }
-            
-            // If direct path fails standard or custom probes, we fallback gracefully to native libuvc
-            diag("Scanner connected \u2014 controls ready (Fallback Path)")
-            Log.w("CameraBridge", "Direct control path failed probe. Falling back to LIBUVC.")
-        }, delayMs)
-    }
-
+    /**
+     * Recovery for a wedged USB control endpoint: closing the device aborts
+     * any control transfer stuck in libusb (their timeout is infinite in this
+     * libuvc build), then we reopen after a short settle delay.
+     */
+    /**
+     * Nuclear unblock for a control transfer wedged inside libuvc (infinite
+     * timeout, holding the UVCCamera monitor). Closing the raw device fd is
+     * the ONLY thing that aborts that transfer — closeCamera() can't, because
+     * it needs the very monitor the wedged thread holds. After this, the
+     * monitor is released, close/reopen can actually run.
+     */
     fun ctlAbortStuckControl() {
         val conn = usbConn
         usbConn = null
+        // 1) Try a REAL USB device reset (hidden API, works on many devices).
+        //    Closing the fd only unblocks OUR thread; the camera's firmware
+        //    stays wedged and the next write stalls again. A port reset
+        //    power-cycles the device logic — the only true recovery short of
+        //    replugging the cable.
         var didReset = false
         try {
             val m = conn?.javaClass?.getMethod("resetDevice")
             didReset = (m?.invoke(conn) as? Boolean) == true
+            deviceWasReset = didReset
             Log.w("CameraBridge", "ctlAbortStuckControl: resetDevice() -> $didReset")
         } catch (t: Throwable) {
             Log.w("CameraBridge", "resetDevice unavailable: $t")
         }
+        // 2) Close the fd regardless — aborts the transfer stuck inside
+        //    libuvc's infinite timeout and releases the UVCCamera monitor.
         try { conn?.close() } catch (_: Throwable) {}
         diag(
             if (didReset) "Scanner USB reset \u2014 restarting\u2026"
@@ -215,20 +209,39 @@ class CameraBridgeFragment : CameraFragment() {
         )
     }
 
+    // Set when ctlAbortStuckControl performed a real USB port reset. The
+    // device re-enumerates after that (detach + attach), so the reopen must
+    // wait longer, and a second attempt is scheduled in case the first one
+    // fires while the device is still enumerating.
+    @Volatile private var deviceWasReset = false
+
     fun ctlRecoverCamera() {
         expInited = false
+        val delayMs = if (deviceWasReset) 2500L else 800L
+        deviceWasReset = false
         try {
             closeCamera()
         } catch (t: Throwable) {
             Log.w("CameraBridge", "ctlRecoverCamera: closeCamera threw", t)
         }
-        view?.postDelayed({
+        val tryOpen = {
             try {
                 openCamera(getCameraView())
             } catch (t: Throwable) {
                 Log.w("CameraBridge", "ctlRecoverCamera: openCamera threw", t)
             }
-        }, 800)
+        }
+        view?.postDelayed({
+            tryOpen()
+            // Retry once more if the camera didn't come up (e.g. the reopen
+            // raced the post-reset re-enumeration). Harmless if already open.
+            view?.postDelayed({
+                if (usbConn == null) {
+                    Log.w("CameraBridge", "ctlRecoverCamera: retrying open after reset")
+                    tryOpen()
+                }
+            }, 3000)
+        }, delayMs)
     }
 
     private fun resolveActualPreviewSize() {
@@ -244,11 +257,11 @@ class CameraBridgeFragment : CameraFragment() {
                     frameH = match.height
                 }
             }
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) {
+        }
     }
 
     override fun onDestroyView() {
-        mainHandler.removeCallbacksAndMessages(null)
         binding = null
         super.onDestroyView()
     }
@@ -266,7 +279,7 @@ class CameraBridgeFragment : CameraFragment() {
         if (direct != null) return direct
 
         return try {
-            val field = cam.javaClass.getDeclaredFields.firstOrNull {
+            val field = cam.javaClass.declaredFields.firstOrNull {
                 it.type.name.contains("UVCCamera")
             }
             if (field != null) {
@@ -288,6 +301,14 @@ class CameraBridgeFragment : CameraFragment() {
         return method.invoke(uvcCamera, *args)
     }
 
+    /**
+     * ONE-TIME DIAGNOSTIC. Logs, for BOTH the CameraUVC wrapper and the raw
+     * mUVCCamera object:
+     *   - every public method whose name contains "exposure" (any case),
+     *     with its parameter types, so we can see the REAL API instead of
+     *     guessing names.
+     * Filter Logcat for tag "CameraBridge" after opening the camera.
+     */
     private fun dumpExposureSurface() {
         safe { cam ->
             Log.d("CameraBridge", "===== EXPOSURE METHOD DUMP START =====")
@@ -308,6 +329,8 @@ class CameraBridgeFragment : CameraFragment() {
                 Log.w("CameraBridge", "  mUVCCamera field: NOT FOUND (reflection failed)")
             } else {
                 Log.d("CameraBridge", "  mUVCCamera class: ${uvc.javaClass.name}")
+                // NOTE: use declaredMethods, not methods — the exposure API in
+                // this AUSBC build is PRIVATE native, invisible to .methods.
                 var c: Class<*>? = uvc.javaClass
                 while (c != null && c != Any::class.java) {
                     c.declaredMethods
@@ -330,7 +353,23 @@ class CameraBridgeFragment : CameraFragment() {
     }
 
     // ---- Scanner controls (UVC) ------------------------------------------
+    //
+    // RULE: once the direct timeout-safe path initialized for this camera
+    // session, it is the ONLY control path. If a direct write fails we DROP
+    // the write (and count it) — we NEVER fall back to libuvc's synchronized
+    // control methods. Their CTRL_TIMEOUT is 0 (= infinite in libusb), so one
+    // stalled request wedges the calling thread inside JNI while it holds the
+    // UVCCamera monitor. From that moment closeCamera()/openCamera() queue up
+    // behind the same monitor and controls are dead for good, even though the
+    // stream (isochronous endpoint, separate thread) keeps running — which is
+    // exactly the "video fine, controls dead after a short freeze" failure.
+    //
+    // The libuvc paths below survive ONLY for the case where direct init
+    // failed at camera-open (direct == null), i.e. we never had a safe path.
 
+    // Consecutive direct-write failures. A stalled EP0 usually recovers only
+    // with a device close/reopen, so after a few failures in a row we trigger
+    // one automatic recovery instead of silently eating writes forever.
     @Volatile private var directFailStreak = 0
     @Volatile private var lastAutoRecoverAt = 0L
 
@@ -405,6 +444,16 @@ class CameraBridgeFragment : CameraFragment() {
     }
 
     // ---- Private reflection helpers ---------------------------------------
+    //
+    // WHY: In the AUSBC version this app compiles against, neither CameraUVC
+    // nor com.jiangdg.uvc.UVCCamera exposes ANY *public* exposure method.
+    // The exposure API only exists as PRIVATE native methods:
+    //     private static native int nativeSetExposureMode(long id, int mode)
+    //     private        native int nativeUpdateExposureLimit(long id)
+    //     private static native int nativeSetExposure(long id, int exposure)
+    // Probing with javaClass.methods (public-only) therefore finds nothing,
+    // which is exactly why the old ctlSetExposure logged "NO working method
+    // found". We call the natives directly using mNativePtr instead.
 
     private fun findDeclaredMethod(
         cls: Class<*>, name: String, vararg params: Class<*>
@@ -415,7 +464,8 @@ class CameraBridgeFragment : CameraFragment() {
                 val m = c.getDeclaredMethod(name, *params)
                 m.isAccessible = true
                 return m
-            } catch (_: NoSuchMethodException) {}
+            } catch (_: NoSuchMethodException) {
+            }
             c = c.superclass
         }
         return null
@@ -428,12 +478,31 @@ class CameraBridgeFragment : CameraFragment() {
                 val f = c.getDeclaredField(name)
                 f.isAccessible = true
                 return f.get(obj)
-            } catch (_: NoSuchFieldException) {}
+            } catch (_: NoSuchFieldException) {
+            }
             c = c.superclass
         }
         return null
     }
 
+    /**
+     * Sets manual absolute exposure by invoking UVCCamera's private native
+     * methods directly (there is no public exposure API in this AUSBC build).
+     *
+     * Sequence (matters!):
+     *  1. nativeSetExposureMode(ptr, 1)  -> UVC AE mode: 1=manual, 2=auto,
+     *     4=shutter priority, 8=aperture priority. Most webcams reject
+     *     exposure-time writes unless the mode is manual first.
+     *  2. nativeUpdateExposureLimit(ptr) -> fills mExposureMin/Max/Def.
+     *     (Known upstream bug: it checks the wrong support bitmask, so it can
+     *     fail on some cameras — we fall back to a sane 100µs-unit range.)
+     *  3. nativeSetExposure(ptr, absValue) -> uvc_set_exposure_abs.
+     *
+     * Native calls return 0 on success, negative libuvc error codes on failure.
+     */
+    // Exposure init cache — mode + limits are written/queried ONCE per
+    // camera-open. Re-sending them on every slider tick multiplied USB
+    // control traffic ~6x and helped wedge cheap webcam firmware.
     @Volatile private var expInited = false
     @Volatile private var expMin = 1
     @Volatile private var expMax = 5000
@@ -459,6 +528,7 @@ class CameraBridgeFragment : CameraFragment() {
             val intT = Int::class.javaPrimitiveType!!
 
             if (!expInited) {
+                // 1) Force manual AE mode, once.
                 val setMode = findDeclaredMethod(cls, "nativeSetExposureMode", longT, intT)
                 val modeRes = try {
                     setMode?.invoke(uvc, ptr, 1) as? Int
@@ -467,6 +537,7 @@ class CameraBridgeFragment : CameraFragment() {
                     null
                 }
 
+                // 2) Query the camera's real exposure-time range, once.
                 try {
                     findDeclaredMethod(cls, "nativeUpdateExposureLimit", longT)?.invoke(uvc, ptr)
                 } catch (e: Throwable) {
@@ -475,6 +546,7 @@ class CameraBridgeFragment : CameraFragment() {
                 var minV = (readDeclaredField(uvc, "mExposureMin") as? Int) ?: 0
                 var maxV = (readDeclaredField(uvc, "mExposureMax") as? Int) ?: 0
                 if (maxV <= minV) {
+                    // Fallback: UVC exposure-time-absolute is in 100 µs units.
                     minV = 1
                     maxV = 5000
                 }
@@ -486,6 +558,7 @@ class CameraBridgeFragment : CameraFragment() {
 
             val scaled = expMin + clamped * (expMax - expMin) / 100
 
+            // 3) Write absolute exposure — single control transfer per tick.
             val setExp = findDeclaredMethod(cls, "nativeSetExposure", longT, intT)
             if (setExp == null) {
                 Log.e("CameraBridge", "ctlSetExposure: nativeSetExposure not found on ${cls.name}")
@@ -554,7 +627,7 @@ class CameraBridgeFragment : CameraFragment() {
         try {
             val cam = getCurrentCamera()
             if (cam is com.jiangdg.ausbc.camera.CameraUVC) block(cam)
-        } catch (_: Throwable) {}
+        } catch (_: Throwable) { }
     }
 
     companion object {
