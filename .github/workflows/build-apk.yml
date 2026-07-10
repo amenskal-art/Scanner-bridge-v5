@@ -1,10 +1,8 @@
 name: Build APK
 
-# Builds the debug APK in the cloud. Runs on every push to main/master, and
-# can also be started by hand from the Actions tab (workflow_dispatch).
+# Builds the debug APK in the cloud. 
+# Triggered ONLY by hand from the Actions tab (workflow_dispatch).
 on:
-  push:
-    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
