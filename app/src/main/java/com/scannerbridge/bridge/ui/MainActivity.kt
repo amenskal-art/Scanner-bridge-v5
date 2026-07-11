@@ -327,7 +327,13 @@ class MainActivity : AppCompatActivity(),
                 try {
                     applyControlToCamera(n, v)
                     lastApplied[n] = v
-                    Thread.sleep(50) // pace EP0 writes; bursts wedge cheap firmware
+                    // Pace EP0 writes; bursts wedge cheap firmware. The
+                    // library path gets a longer gap: its transfers have no
+                    // timeout, so the cost of provoking a firmware stall
+                    // there is a wedged thread + full USB reset, not a
+                    // dropped value. 120 ms still lets a drag apply ~8
+                    // coalesced updates/second — visually smooth.
+                    Thread.sleep(if (watched) 120 else 50)
                 } catch (_: Throwable) {
                 } finally {
                     controlBusySince = 0L
