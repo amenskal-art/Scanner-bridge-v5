@@ -77,6 +77,46 @@ class CameraBridgeFragment : CameraFragment() {
 
     private var binding: FragmentCameraBinding? = null
 
+    // ---- Preview fit-to-container --------------------------------------
+    // Fixes the "small / squished in-app preview": AUSBC re-adds the render
+    // TextureView MATCH_PARENT into the container, and when the container's
+    // aspect doesn't match the video's, the GL output can end up stretched
+    // to fill the wrong-shaped box (AspectRatioTextureView's own measure
+    // pass races the surface creation). We size the view EXACTLY to the
+    // largest frameW:frameH rectangle that fits the container, centered —
+    // then the view aspect == video aspect and nothing can distort.
+    @Volatile private var lastFitW = 0
+    @Volatile private var lastFitH = 0
+
+    private fun fitRenderToContainer() {
+        val b = binding ?: return
+        val cw = b.cameraContainer.width
+        val ch = b.cameraContainer.height
+        val vw = frameW
+        val vh = frameH
+        if (cw <= 0 || ch <= 0 || vw <= 0 || vh <= 0) return
+        var w = cw
+        var h = cw * vh / vw
+        if (h > ch) {
+            h = ch
+            w = ch * vw / vh
+        }
+        if (w == lastFitW && h == lastFitH) return
+        lastFitW = w
+        lastFitH = h
+        b.cameraRender.layoutParams = android.widget.FrameLayout.LayoutParams(
+            w, h, android.view.Gravity.CENTER
+        )
+    }
+
+    /** Refit the render view to its container; safe from any thread. */
+    fun refitPreview() {
+        mainH.post {
+            lastFitW = 0 // container may have changed size -> force reapply
+            fitRenderToContainer()
+        }
+    }
+
     private val reqWidth = 1920
     private val reqHeight = 1080
 
@@ -123,8 +163,11 @@ class CameraBridgeFragment : CameraFragment() {
             val w = if (width > 0) width else frameW
             val h = if (height > 0) height else frameH
             if (width > 0 && height > 0) {
-                frameW = width
-                frameH = height
+                if (width != frameW || height != frameH) {
+                    frameW = width
+                    frameH = height
+                    refitPreview() // real stream size differs from requested
+                }
             }
 
             val isNv21 = (format == IPreviewDataCallBack.DataFormat.NV21)
@@ -142,6 +185,16 @@ class CameraBridgeFragment : CameraFragment() {
     override fun initView() {
         super.initView()
         addPreviewDataCallBack(previewCallback)
+        lastFitW = 0
+        lastFitH = 0
+        // Refit whenever the container changes size (fullscreen toggle,
+        // rotation, portrait host resize).
+        binding?.cameraContainer?.addOnLayoutChangeListener {
+                _, l, t, r, btm, ol, ot, orr, ob ->
+            if ((r - l) != (orr - ol) || (btm - t) != (ob - ot)) {
+                mainH.post { fitRenderToContainer() }
+            }
+        }
     }
 
     override fun onCameraState(
@@ -204,6 +257,7 @@ class CameraBridgeFragment : CameraFragment() {
                     binding?.cameraRender?.setAspectRatio(frameW, frameH)
                 } catch (_: Throwable) {
                 }
+                refitPreview()
                 if (DEBUG_EXPOSURE) {
                     dumpExposureSurface()
                 }
