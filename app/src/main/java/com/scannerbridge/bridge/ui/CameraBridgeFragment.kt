@@ -152,6 +152,8 @@ class CameraBridgeFragment : CameraFragment() {
         when (code) {
             ICameraStateCallBack.State.OPENED -> {
                 expInited = false
+                wbLibInited = false
+                wbLibSetter = null
                 directFailStreak = 0
                 directFirstUseFails = 0
                 directEverOk = false
@@ -171,15 +173,27 @@ class CameraBridgeFragment : CameraFragment() {
                 // inside libuvc's infinite-timeout JNI while holding the
                 // UVCCamera monitor. The watchdog + USB reset remain as a
                 // last resort, no longer the primary recovery.
-                direct = UvcDirectControls.from(getCurrentCamera())?.also { d ->
-                    d.diagSink = { msg -> diag(msg, true) }
+                val devKey = currentDeviceKey()
+                if (isDirectBlocked(devKey)) {
+                    // This camera already proved it rejects app-level control
+                    // transfers (persisted per vid:pid). Skip the direct
+                    // attempt entirely — library path from the first write,
+                    // no failed-write noise at the start of the session.
+                    direct = null
+                    Log.i("CameraBridge",
+                        "control path: LIBUVC (direct blocked for $devKey)")
+                    diag("Scanner connected \u2014 controls ready (library mode)")
+                } else {
+                    direct = UvcDirectControls.from(getCurrentCamera())?.also { d ->
+                        d.diagSink = { msg -> diag(msg, true) }
+                    }
+                    Log.i(
+                        "CameraBridge",
+                        "control path: " + if (direct != null)
+                            "DIRECT (timeout-safe, lazy init)" else "LIBUVC (direct unavailable)"
+                    )
+                    diag("Scanner connected \u2014 controls ready")
                 }
-                Log.i(
-                    "CameraBridge",
-                    "control path: " + if (direct != null)
-                        "DIRECT (timeout-safe, lazy init)" else "LIBUVC (direct unavailable)"
-                )
-                diag("Scanner connected \u2014 controls ready")
                 resolveActualPreviewSize()
                 frameBridge?.setResolution(frameW, frameH)
                 try {
@@ -197,12 +211,16 @@ class CameraBridgeFragment : CameraFragment() {
             }
             ICameraStateCallBack.State.CLOSED -> {
                 expInited = false
+                wbLibInited = false
+                wbLibSetter = null
                 direct = null
                 usbConn = null
                 callbacks?.onCameraClosed()
             }
             ICameraStateCallBack.State.ERROR -> {
                 expInited = false
+                wbLibInited = false
+                wbLibSetter = null
                 direct = null
                 usbConn = null
                 callbacks?.onCameraClosed()
@@ -270,6 +288,8 @@ class CameraBridgeFragment : CameraFragment() {
      */
     fun ctlRecoverCamera() {
         expInited = false
+        wbLibInited = false
+        wbLibSetter = null
         val wasReset = deviceWasReset
         deviceWasReset = false
         try {
@@ -470,6 +490,11 @@ class CameraBridgeFragment : CameraFragment() {
                 Log.w("CameraBridge", "direct path never answered — falling back to libuvc for this session")
                 diag("Direct USB path not answering \u2014 switching to library path", err = true, force = true)
                 direct = null
+                // Remember this device permanently: the failures come back
+                // instantly (STALL), not as timeouts — this hardware will
+                // never accept the direct path, so future connects go
+                // straight to the library path with zero failed writes.
+                blockDirect(currentDeviceKey())
             }
             return
         }
@@ -684,48 +709,51 @@ class CameraBridgeFragment : CameraFragment() {
         }
     }
 
+    // libuvc wb_temp session cache. The old code did auto-WB-off + min/max
+    // queries + ALL THREE setter-name attempts on EVERY slider tick — a burst
+    // of infinite-timeout libuvc transfers per tick, which is exactly the
+    // load profile that wedges this camera on the library path. Now each of
+    // those happens ONCE per camera open, and a drag tick costs exactly one
+    // transfer through one resolved setter.
+    @Volatile private var wbLibInited = false
+    @Volatile private var wbLibMin = 2800
+    @Volatile private var wbLibMax = 6500
+    @Volatile private var wbLibSetter: java.lang.reflect.Method? = null
+
     fun ctlSetWbTemp(percent: Int) {
         direct?.let { directResult(it.setWbTempPercent(percent)); return }
         safe { cam ->
             val uvc = getUvcCamera(cam) ?: return@safe
             try {
-                try {
-                    callUvcMethod(uvc, "setAutoWhiteBalance", false)
-                } catch (_: Throwable) {}
-
-                var minVal: Int? = null
-                for (methodName in listOf("getWhiteBalanceMin", "getWhiteBalanceTempMin", "getWbTempMin")) {
+                if (!wbLibInited) {
                     try {
-                        val res = callUvcMethod(uvc, methodName) as? Int
-                        if (res != null) {
-                            minVal = res
-                            break
-                        }
+                        callUvcMethod(uvc, "setAutoWhiteBalance", false)
                     } catch (_: Throwable) {}
-                }
 
-                var maxVal: Int? = null
-                for (methodName in listOf("getWhiteBalanceMax", "getWhiteBalanceTempMax", "getWbTempMax")) {
-                    try {
-                        val res = callUvcMethod(uvc, methodName) as? Int
-                        if (res != null) {
-                            maxVal = res
-                            break
-                        }
-                    } catch (_: Throwable) {}
-                }
-
-                val realMin = minVal ?: 2800
-                val realMax = maxVal ?: 6500
-
-                if (realMax > realMin) {
-                    val scaled = realMin + (percent.coerceIn(0, 100) * (realMax - realMin) / 100)
-                    for (methodName in listOf("setWhiteBalance", "setWhiteBalanceTemp", "setWbTemp")) {
-                        try {
-                            callUvcMethod(uvc, methodName, scaled)
-                        } catch (_: Throwable) {}
+                    for (methodName in listOf("getWhiteBalanceMin", "getWhiteBalanceTempMin", "getWbTempMin")) {
+                        val res = try { callUvcMethod(uvc, methodName) as? Int } catch (_: Throwable) { null }
+                        if (res != null) { wbLibMin = res; break }
                     }
+                    for (methodName in listOf("getWhiteBalanceMax", "getWhiteBalanceTempMax", "getWbTempMax")) {
+                        val res = try { callUvcMethod(uvc, methodName) as? Int } catch (_: Throwable) { null }
+                        if (res != null) { wbLibMax = res; break }
+                    }
+                    // Resolve the setter METHOD once; a tick then invokes
+                    // exactly one method instead of probing three names.
+                    wbLibSetter = listOf("setWhiteBalance", "setWhiteBalanceTemp", "setWbTemp")
+                        .firstNotNullOfOrNull { name ->
+                            uvc.javaClass.methods.firstOrNull {
+                                it.name == name && it.parameterTypes.size == 1
+                            }
+                        }
+                    if (wbLibMax <= wbLibMin) { wbLibMin = 2800; wbLibMax = 6500 }
+                    wbLibInited = true
                 }
+
+                val scaled = wbLibMin + (percent.coerceIn(0, 100) * (wbLibMax - wbLibMin) / 100)
+                try {
+                    wbLibSetter?.invoke(uvc, scaled)
+                } catch (_: Throwable) {}
             } catch (_: Throwable) {}
         }
     }
@@ -739,5 +767,48 @@ class CameraBridgeFragment : CameraFragment() {
 
     companion object {
         fun newInstance() = CameraBridgeFragment()
+
+        // Devices (vid:pid) where the direct app-level control path proved
+        // non-functional — they STALL every UsbDeviceConnection transfer
+        // while libusb owns the interface (instant r=-1, not timeouts).
+        // Once detected, the device goes on this list (in-memory + persisted)
+        // and every future open goes STRAIGHT to the library path, instead
+        // of burning 15-30 s of failed writes rediscovering it per connect.
+        private val directBlockedThisRun:
+            MutableSet<String> = java.util.Collections.synchronizedSet(HashSet())
+        private const val PREFS = "scanner_ctrl"
+        private const val PREF_BLOCKED = "direct_blocked_devices"
+    }
+
+    private fun currentDeviceKey(): String {
+        return try {
+            val cam = getCurrentCamera() ?: return "unknown"
+            val ctrl = readDeclaredField(cam, "mCtrlBlock") ?: return "unknown"
+            val dev = try {
+                ctrl.javaClass.getMethod("getDevice").invoke(ctrl)
+                        as? android.hardware.usb.UsbDevice
+            } catch (_: Throwable) { null } ?: return "unknown"
+            "${dev.vendorId}:${dev.productId}"
+        } catch (_: Throwable) { "unknown" }
+    }
+
+    private fun isDirectBlocked(key: String): Boolean {
+        if (key in directBlockedThisRun) return true
+        return try {
+            val prefs = context?.getSharedPreferences(
+                PREFS, android.content.Context.MODE_PRIVATE) ?: return false
+            prefs.getStringSet(PREF_BLOCKED, emptySet())?.contains(key) == true
+        } catch (_: Throwable) { false }
+    }
+
+    private fun blockDirect(key: String) {
+        directBlockedThisRun.add(key)
+        try {
+            val prefs = context?.getSharedPreferences(
+                PREFS, android.content.Context.MODE_PRIVATE) ?: return
+            val cur = HashSet(prefs.getStringSet(PREF_BLOCKED, emptySet()) ?: emptySet())
+            cur.add(key)
+            prefs.edit().putStringSet(PREF_BLOCKED, cur).apply()
+        } catch (_: Throwable) {}
     }
 }
