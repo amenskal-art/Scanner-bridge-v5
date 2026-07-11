@@ -294,7 +294,7 @@ class MainActivity : AppCompatActivity(),
     private var controlThread = android.os.HandlerThread("ScannerControlThread").apply { start() }
     private var controlHandler = Handler(controlThread.looper)
 
-    // Set on every camera-open. For the first CONTROL_QUIET_MS after an open
+    // Set on every camera-open. For the first controlQuietMs after an open
     // NO control write reaches the camera: libusb issues its own control
     // traffic while the stream spins up, and mixing our writes into that
     // window is what wedges this camera's firmware (field-tested). Writes
@@ -302,10 +302,18 @@ class MainActivity : AppCompatActivity(),
     // the moment the window closes.
     @Volatile private var cameraOpenedAt = 0L
     private val CONTROL_QUIET_MS = 3000L
+    // A reopen right after a forced USB reset is the firmware's most fragile
+    // moment (just power-cycled + full stream re-negotiation). Give it a
+    // longer quiet window there — the round-8 field log showed the automatic
+    // re-apply of touched controls stalling ~9 s after every reset-reopen,
+    // which is what kept the reset loop feeding itself.
+    private val CONTROL_QUIET_AFTER_RESET_MS = 6000L
+    @Volatile private var controlQuietMs = CONTROL_QUIET_MS
+    @Volatile private var lastRecoveryAt = 0L
 
     private val writePendingControlsRunnable = object : Runnable {
         override fun run() {
-            val quietLeft = (cameraOpenedAt + CONTROL_QUIET_MS) - System.currentTimeMillis()
+            val quietLeft = (cameraOpenedAt + controlQuietMs) - System.currentTimeMillis()
             if (quietLeft > 0) {
                 controlHandler.postDelayed(this, quietLeft)
                 return
@@ -324,16 +332,26 @@ class MainActivity : AppCompatActivity(),
                 // genuinely wedge, so only they are watched.
                 val watched = cameraFragment?.isDirectControlActive() != true
                 if (watched) controlBusySince = System.currentTimeMillis()
+                val t0 = System.currentTimeMillis()
                 try {
                     applyControlToCamera(n, v)
                     lastApplied[n] = v
+                    // Field breadcrumb: this camera answers EP0 SLOWLY under
+                    // full stream + PC load (libuvc has no timeout, so the
+                    // write blocks until it answers). Report how slow, so
+                    // the on-screen log tells us the real latency instead of
+                    // the old behavior of resetting before we could see it.
+                    if (watched) {
+                        val took = System.currentTimeMillis() - t0
+                        if (took > 2000) reportSlowLibWrite(took)
+                    }
                     // Pace EP0 writes; bursts wedge cheap firmware. The
                     // library path gets a longer gap: its transfers have no
                     // timeout, so the cost of provoking a firmware stall
                     // there is a wedged thread + full USB reset, not a
-                    // dropped value. 120 ms still lets a drag apply ~8
-                    // coalesced updates/second — visually smooth.
-                    Thread.sleep(if (watched) 120 else 50)
+                    // dropped value. Coalescing means a drag still lands on
+                    // its final value.
+                    Thread.sleep(if (watched) 250 else 50)
                 } catch (_: Throwable) {
                 } finally {
                     controlBusySince = 0L
@@ -351,27 +369,57 @@ class MainActivity : AppCompatActivity(),
         controlHandler.postDelayed(writePendingControlsRunnable, 100)
     }
 
-    /**
-     * Called once a second from the stats ticker. If a control write has been
-     * stuck inside JNI for >4 s, the webcam has stalled the USB control
-     * endpoint and that HandlerThread will never come back on its own.
-     * Recovery: abandon the wedged thread, spin up a fresh one, and
-     * close/reopen the camera — closing the device handle aborts the pending
-     * libusb transfer, which also lets the old thread finally exit.
-     */
+    // Two-stage library-path watchdog.
+    //
+    // WHY THE OLD 4 s THRESHOLD WAS WRONG (round-8 field log): on this
+    // camera EVERY libuvc control write under full stream + PC-client load
+    // takes longer than 4 s to answer — but it DOES answer. libuvc's
+    // infinite timeout was getting every one of those writes through
+    // eventually (round-5 evidence). The 4 s watchdog therefore classified
+    // every ordinary slider adjustment as "wedged" and fired the nuclear
+    // USB reset — freeze, reconnect, automatic re-apply of controls, which
+    // stalled again 9 s after the reopen, reset again… the exact loop in
+    // the field log. A slow write is NOT a wedged write.
+    //
+    // New behavior:
+    //   * >= 5 s  -> informational notice, keep waiting. The write runs on
+    //               the dedicated control HandlerThread; the UI and the
+    //               stream are untouched while it waits.
+    //   * >= 15 s -> NOW it's a genuinely wedged transfer (firmware EP0
+    //               dead). Same nuclear recovery as before: abandon the
+    //               wedged thread, close the fd to abort the transfer,
+    //               real USB port reset, reopen.
+    private val LIB_SLOW_NOTICE_MS = 5000L
+    private val LIB_STALL_RESET_MS = 15000L
+    @Volatile private var slowNoticeShownFor = 0L
+
+    // At most one "answered slowly" info line per 10 s — it's a breadcrumb,
+    // not spam.
+    @Volatile private var lastSlowReportAt = 0L
+    private fun reportSlowLibWrite(tookMs: Long) {
+        val now = System.currentTimeMillis()
+        if (now - lastSlowReportAt < 10000) return
+        lastSlowReportAt = now
+        val secs = String.format(java.util.Locale.US, "%.1f", tookMs / 1000.0)
+        onControlDiag("Control applied \u2014 scanner answered in $secs s (slow under stream load)", false)
+    }
+
     private fun checkControlWatchdog() {
         val since = controlBusySince
         if (since == 0L || recovering) return
-        // controlBusySince is only ever armed for LIBUVC writes now (the
-        // direct path self-timeouts and is never watched), so >4 s here
-        // unambiguously means a thread wedged in an infinite-timeout JNI
-        // transfer — the one case where the nuclear reset is correct.
-        if (System.currentTimeMillis() - since < 4000) return
+        val stuckMs = System.currentTimeMillis() - since
+        if (stuckMs >= LIB_SLOW_NOTICE_MS && slowNoticeShownFor != since) {
+            slowNoticeShownFor = since
+            onControlDiag(
+                "Scanner answering slowly \u2014 waiting (stream unaffected)\u2026", false)
+        }
+        if (stuckMs < LIB_STALL_RESET_MS) return
 
         recovering = true
+        lastRecoveryAt = System.currentTimeMillis()
         controlBusySince = 0L
         toast("Scanner controls stalled — resetting…")
-        onControlDiag("Control write stalled >4 s \u2014 forcing scanner reset", true)
+        onControlDiag("Control write stalled >${LIB_STALL_RESET_MS / 1000} s \u2014 forcing scanner reset", true)
 
         try { controlThread.quitSafely() } catch (_: Throwable) {}
         controlThread = android.os.HandlerThread("ScannerControlThread-r").apply { start() }
@@ -512,7 +560,15 @@ class MainActivity : AppCompatActivity(),
                 server?.controlState?.applyOne(name, value, "ui")
             }
             override fun onStartTrackingTouch(s: android.widget.SeekBar?) {}
-            override fun onStopTrackingTouch(s: android.widget.SeekBar?) {}
+            override fun onStopTrackingTouch(s: android.widget.SeekBar?) {
+                // Guarantee the RELEASE value lands even if intermediate drag
+                // values were coalesced away while a slow write was in flight.
+                val v = s?.progress ?: return
+                if (applyingRemote) return
+                userTouched.add(name)
+                enqueueControl(name, v)
+                server?.controlState?.applyOne(name, v, "ui")
+            }
         }
         sbNormal.setOnSeekBarChangeListener(listener)
         sbFs.setOnSeekBarChangeListener(listener)
@@ -612,9 +668,9 @@ class MainActivity : AppCompatActivity(),
             if (gen == openGeneration && cameraReady) applyInitialCameraControlsNow()
         }
         pendingInitialControls = r
-        // Past the CONTROL_QUIET_MS window: the writer thread wouldn't send
-        // earlier anyway, this just avoids pointless queue churn.
-        ui.postDelayed(r, CONTROL_QUIET_MS + 200)
+        // Past the quiet window: the writer thread wouldn't send earlier
+        // anyway, this just avoids pointless queue churn.
+        ui.postDelayed(r, controlQuietMs + 200)
     }
 
     // Controls the user (or the PC) has actually adjusted this session.
@@ -655,6 +711,40 @@ class MainActivity : AppCompatActivity(),
                 "MainActivity",
                 "initial controls: re-applying $n adjusted control(s) (of ${values.size})"
             )
+        }
+    }
+
+    // ---------------- preview sizing (portrait) ----------------
+    // Last frame size the camera reported — drives the preview box aspect.
+    @Volatile private var lastVideoW = 0
+    @Volatile private var lastVideoH = 0
+
+    /**
+     * Portrait: size the preview box to the VIDEO's aspect ratio instead of
+     * the old fixed 240 dp. With a 16:9 feed inside a fixed-height box the
+     * render either letterboxed (small) or, when AUSBC's aspect pass lost the
+     * race, stretched to fill (squished). Matching the box to the video makes
+     * the feed fill the card edge-to-edge at the correct ratio — same
+     * proportions as the PC window. Fullscreen manages its own sizing.
+     */
+    private fun fitPortraitPreviewHost() {
+        if (isFullscreen) return
+        val vw = lastVideoW
+        val vh = lastVideoH
+        if (vw <= 0 || vh <= 0) return
+        binding.previewHost.post {
+            if (isFullscreen) return@post
+            val w = binding.previewHost.width
+            if (w <= 0) return@post
+            var h = w * vh / vw
+            // Portrait-orientation cameras: don't let the box eat the screen.
+            val maxH = (resources.displayMetrics.heightPixels * 0.6f).toInt()
+            if (h > maxH) h = maxH
+            if (binding.previewHost.layoutParams.height != h) {
+                binding.previewHost.layoutParams =
+                    binding.previewHost.layoutParams.apply { height = h }
+            }
+            cameraFragment?.refitPreview()
         }
     }
 
@@ -711,6 +801,7 @@ class MainActivity : AppCompatActivity(),
 
         binding.contentScroll.scrollTo(0, 0)
         binding.fullscreenOverlay.visibility = View.VISIBLE
+        cameraFragment?.refitPreview()
 
         binding.fsControlsScroll.visibility = View.GONE
         binding.fsToggleControlsButton.text = "Controls"
@@ -748,6 +839,7 @@ class MainActivity : AppCompatActivity(),
         }
 
         binding.contentScroll.post { binding.contentScroll.scrollTo(0, savedScrollY) }
+        fitPortraitPreviewHost()
     }
 
     private fun setSiblingCardsVisible(visibility: Int) {
@@ -794,6 +886,13 @@ class MainActivity : AppCompatActivity(),
     override fun onCameraOpened(width: Int, height: Int) {
         cameraReady = true
         cameraOpenedAt = System.currentTimeMillis()
+        // Reopen shortly after a forced reset -> firmware just power-cycled,
+        // hold control writes back longer than after a normal open.
+        controlQuietMs =
+            if (cameraOpenedAt - lastRecoveryAt < 30000) CONTROL_QUIET_AFTER_RESET_MS
+            else CONTROL_QUIET_MS
+        lastVideoW = width
+        lastVideoH = height
         val gen = ++openGeneration
         lastApplied.clear() // fresh device state -> re-send everything
         if (frameBridge != null) {
@@ -802,6 +901,7 @@ class MainActivity : AppCompatActivity(),
         applyInitialCameraControls(gen)
         runOnUiThread {
             binding.previewPlaceholder.visibility = View.GONE
+            fitPortraitPreviewHost()
             updateUi()
         }
     }
