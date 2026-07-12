@@ -261,6 +261,20 @@ class CameraBridgeFragment : CameraFragment() {
     // or NV21 frames (and with them the whole PC stream) silently die.
     @Volatile private var streamPaused = false
 
+    // The physical USB device of the current session — captured at OPENED so
+    // recovery paths can reconnect/reset even after the camera object or its
+    // control block is gone. Also the STABLE source for the blocklist key:
+    // round-11 showed sessions starting in direct mode on a device that was
+    // blocklisted rounds ago — the old key came from mCtrlBlock reflection,
+    // which can yield "unknown" on one side (block/check) and the real
+    // vid:pid on the other, so the entries never matched.
+    @Volatile private var lastKnownDevice: android.hardware.usb.UsbDevice? = null
+    // True between OPENED and CLOSED/ERROR — the reliable "camera is back"
+    // signal for reopen guards. The old guard checked usbConn != null, but
+    // usbConn is only set when the DIRECT path initializes; in library mode
+    // it stays null, which is why recovery could double-open the camera.
+    @Volatile private var camOpen = false
+
     // GL-mode resume target, captured at pause time. Round-9 blackout root
     // cause (verified in AUSBC native source, UVCPreview.cpp): native
     // stopPreview() does ANativeWindow_release(mPreviewWindow) and NULLs
@@ -474,6 +488,9 @@ class CameraBridgeFragment : CameraFragment() {
                     diag("Scanner connected \u2014 controls ready")
                 }
                 streamPaused = false
+                camOpen = true
+                lastKnownDevice = try { getCurrentCamera()?.device } catch (_: Throwable) { null }
+                    ?: lastKnownDevice
                 readNegotiatedSize()
                 diag("Video: ${frameW}\u00d7${frameH}", err = false, force = true)
                 diagCameraModes()
@@ -494,6 +511,7 @@ class CameraBridgeFragment : CameraFragment() {
                 callbacks?.onCameraOpened(frameW, frameH)
             }
             ICameraStateCallBack.State.CLOSED -> {
+                camOpen = false
                 expInited = false
                 wbLibInited = false
                 wbLibSetter = null
@@ -503,6 +521,7 @@ class CameraBridgeFragment : CameraFragment() {
                 callbacks?.onCameraClosed()
             }
             ICameraStateCallBack.State.ERROR -> {
+                camOpen = false
                 expInited = false
                 wbLibInited = false
                 wbLibSetter = null
@@ -553,7 +572,45 @@ class CameraBridgeFragment : CameraFragment() {
         usbConn = null
         direct = null
         deviceWasReset = false
+        ctrlBlockClosed = true
         diag("Stuck control aborted \u2014 restarting camera engine\u2026", true)
+    }
+
+    // Set when the soft abort closed AUSBC's UsbControlBlock. Round-11
+    // proved plain openCamera() can NOT recover from that: CameraFragment's
+    // openCamera reuses the existing ICamera with its now-DEAD control
+    // block (no USB detach ever fired, so onDisconnectDev never cleared
+    // it), fails, retries the same dead block, and the app sits at
+    // "No scanner" forever. The working route is requestPermission(device):
+    // USBMonitor re-processes the connect and onConnectDev installs a
+    // FRESH UsbControlBlock before opening.
+    @Volatile private var ctrlBlockClosed = false
+
+    /**
+     * Last-resort reset when even the soft-recovery reopen fails: open a
+     * brand-new fd straight from UsbManager (independent of AUSBC's dead
+     * block) just to issue resetDevice(), then let the re-enumeration
+     * attach flow rebuild everything.
+     */
+    fun ctlResetFromScratch(): Boolean {
+        val dev = lastKnownDevice ?: return false
+        return try {
+            val um = context?.getSystemService(android.content.Context.USB_SERVICE)
+                as? android.hardware.usb.UsbManager ?: return false
+            val conn = um.openDevice(dev) ?: return false
+            val ok = try {
+                (conn.javaClass.getMethod("resetDevice")
+                    .invoke(conn) as? Boolean) == true
+            } finally {
+                try { conn.close() } catch (_: Throwable) {}
+            }
+            deviceWasReset = ok
+            Log.w("CameraBridge", "ctlResetFromScratch -> $ok")
+            ok
+        } catch (t: Throwable) {
+            Log.w("CameraBridge", "ctlResetFromScratch failed", t)
+            false
+        }
     }
 
     fun ctlAbortStuckControl() {
@@ -613,13 +670,30 @@ class CameraBridgeFragment : CameraFragment() {
         } catch (t: Throwable) {
             Log.w("CameraBridge", "ctlRecoverCamera: closeCamera threw", t)
         }
+        val blockWasDead = ctrlBlockClosed
+        ctrlBlockClosed = false
         val tryOpenIfNeeded = Runnable {
             // Only open if the camera hasn't already come back. After a real
             // USB reset the device re-enumerates and AUSBC's attach handling
             // reopens it BY ITSELF — our unconditional reopen plus the retry
             // used to race that, producing 3 opens (and 3 "Scanner connected"
             // lines, and 3 scheduled control bursts) per reset.
-            if (usbConn != null) return@Runnable
+            // (Guard is camOpen, not usbConn: usbConn stays null in library
+            // mode, which let this fire on an already-open camera.)
+            if (camOpen) return@Runnable
+            val dev = lastKnownDevice
+            if (blockWasDead && dev != null) {
+                // The soft abort closed AUSBC's UsbControlBlock. Reopening
+                // with the dead block just fails (round-11: permanent
+                // "No scanner"). requestPermission() re-runs the connect
+                // flow: onConnectDev installs a FRESH block, then opens.
+                try {
+                    requestPermission(dev)
+                    return@Runnable
+                } catch (t: Throwable) {
+                    Log.w("CameraBridge", "reconnect via requestPermission threw", t)
+                }
+            }
             try {
                 openCamera(getCameraView())
             } catch (t: Throwable) {
@@ -794,6 +868,12 @@ class CameraBridgeFragment : CameraFragment() {
             return
         }
         if (!directEverOk) {
+            // Instant failures are STALLs (the device actively rejected the
+            // request), not timeouts. Two of those are conclusive — waiting
+            // for five burned ~40 s of dead sliders at every connect.
+            val lastMs = direct?.lastSetMs ?: -1
+            val stallLike = lastMs in 0..999
+            val failLimit = if (stallLike) 2 else 5
             // With the 4 s timeout + retry, one failed SET means the camera
             // didn't answer for ~8.4 s. Five of those in a row (~40 s of
             // silence) is real evidence the app-level path doesn't work on
@@ -802,7 +882,7 @@ class CameraBridgeFragment : CameraFragment() {
             // whose infinite-timeout write then wedged and triggered the
             // reset. This message is forced past the diag throttle: in the
             // round-5 log it was swallowed and the fallback was invisible.
-            if (++directFirstUseFails >= 5) {
+            if (++directFirstUseFails >= failLimit) {
                 Log.w("CameraBridge", "direct path never answered — falling back to libuvc for this session")
                 diag("Direct USB path not answering \u2014 switching to library path", err = true, force = true)
                 direct = null
@@ -1097,6 +1177,17 @@ class CameraBridgeFragment : CameraFragment() {
     }
 
     private fun currentDeviceKey(): String {
+        // Primary: ICamera.device (public val, alive for the whole session).
+        // Secondary: lastKnownDevice captured at OPENED. The old
+        // mCtrlBlock-reflection path is the last resort — it produced
+        // "unknown" intermittently, which silently broke blocklist
+        // persistence (block stored under one key, checked under another).
+        try {
+            val dev = (try { getCurrentCamera()?.device } catch (_: Throwable) { null })
+                ?: lastKnownDevice
+            if (dev != null) return "${dev.vendorId}:${dev.productId}"
+        } catch (_: Throwable) {
+        }
         return try {
             val cam = getCurrentCamera() ?: return "unknown"
             val ctrl = readDeclaredField(cam, "mCtrlBlock") ?: return "unknown"
@@ -1115,6 +1206,31 @@ class CameraBridgeFragment : CameraFragment() {
                 PREFS, android.content.Context.MODE_PRIVATE) ?: return false
             prefs.getStringSet(PREF_BLOCKED, emptySet())?.contains(key) == true
         } catch (_: Throwable) { false }
+    }
+
+    /**
+     * Controls this specific camera WEDGES on (learned at runtime, e.g.
+     * "exposure" in the round-11 log). Persisted per device so the next
+     * session never sends them at all.
+     */
+    fun loadQuarantine(): Set<String> {
+        return try {
+            val prefs = context?.getSharedPreferences(
+                PREFS, android.content.Context.MODE_PRIVATE) ?: return emptySet()
+            prefs.getStringSet("quarantine:" + currentDeviceKey(), emptySet())
+                ?.toSet() ?: emptySet()
+        } catch (_: Throwable) { emptySet() }
+    }
+
+    fun persistQuarantine(name: String) {
+        try {
+            val prefs = context?.getSharedPreferences(
+                PREFS, android.content.Context.MODE_PRIVATE) ?: return
+            val key = "quarantine:" + currentDeviceKey()
+            val cur = HashSet(prefs.getStringSet(key, emptySet()) ?: emptySet())
+            cur.add(name)
+            prefs.edit().putStringSet(key, cur).apply()
+        } catch (_: Throwable) {}
     }
 
     private fun blockDirect(key: String) {
