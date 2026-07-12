@@ -117,6 +117,157 @@ class CameraBridgeFragment : CameraFragment() {
         }
     }
 
+    // ---- Actual negotiated video size + auto resolution upgrade -----------
+    //
+    // ROOT CAUSE of the small / 4:3 / black-bars preview (round-8
+    // screenshots): AUSBC's getSuitableSize() has a trap — if the exact
+    // requested size isn't in the camera's mode list and no same-aspect
+    // size matches, it prefers ANY mode with width==640 or height==480
+    // (its DEFAULT_PREVIEW_* constants) over the largest available mode.
+    // So "request 1920x1080" silently negotiates e.g. 640x480. The
+    // negotiated value is written back into mCameraRequest, and the frame
+    // callback delivers at that size — so BOTH the phone preview AND the
+    // frames streamed to the PC are the small mode. Meanwhile the old
+    // resolveActualPreviewSize() guessed from the ADVERTISED size list
+    // (which does contain 1920x1080), so the preview box was shaped 16:9
+    // while the real frames were 4:3 — that mismatch is exactly the black
+    // bars in the screenshots.
+
+    /** frameW/frameH := the size AUSBC actually negotiated (not a guess). */
+    private fun readNegotiatedSize() {
+        try {
+            val cam = getCurrentCamera() ?: return
+            val req = readDeclaredField(cam, "mCameraRequest")
+            val w = (req?.let { readDeclaredField(it, "previewWidth") }) as? Int ?: 0
+            val h = (req?.let { readDeclaredField(it, "previewHeight") }) as? Int ?: 0
+            if (w > 0 && h > 0) {
+                frameW = w
+                frameH = h
+                return
+            }
+        } catch (_: Throwable) {
+        }
+        resolveActualPreviewSize() // legacy guess, only as fallback
+    }
+
+    // One attempt per fragment lifetime: if the camera negotiated less than
+    // the best mode it advertises, close/reopen at the best mode.
+    @Volatile private var resolutionFixTried = false
+
+    private fun pickBestSize(
+        sizes: List<com.jiangdg.ausbc.camera.bean.PreviewSize>
+    ): com.jiangdg.ausbc.camera.bean.PreviewSize? {
+        if (sizes.isEmpty()) return null
+        // 1) exact request
+        sizes.firstOrNull { it.width == reqWidth && it.height == reqHeight }
+            ?.let { return it }
+        val cap = reqWidth * reqHeight
+        // 2) largest 16:9 not above the requested pixel budget
+        sizes.filter { it.width * 9 == it.height * 16 && it.width * it.height <= cap }
+            .maxByOrNull { it.width * it.height }
+            ?.let { return it }
+        // 3) largest anything within budget, else the smallest available
+        return sizes.filter { it.width * it.height <= cap }
+            .maxByOrNull { it.width * it.height }
+            ?: sizes.minByOrNull { it.width * it.height }
+    }
+
+    private fun maybeUpgradeResolution() {
+        if (resolutionFixTried) return
+        val cam = getCurrentCamera() ?: return
+        val sizes = try { cam.getAllPreviewSizes() } catch (_: Throwable) { null }
+        if (sizes.isNullOrEmpty()) return
+        val best = pickBestSize(sizes) ?: return
+        if (best.width * best.height <= frameW * frameH) return // already best
+        resolutionFixTried = true
+        diag(
+            "Camera opened at ${frameW}\u00d7${frameH} \u2014 " +
+                "switching to ${best.width}\u00d7${best.height}\u2026",
+            err = false, force = true
+        )
+        // updateResolution() closes + reopens the camera itself; give the
+        // OPENED handling a beat to finish first. Called via reflection so
+        // the build can't break if this AUSBC artifact lacks the method.
+        mainH.postDelayed({
+            try {
+                val c = getCurrentCamera() ?: return@postDelayed
+                val m = c.javaClass.methods.firstOrNull {
+                    it.name == "updateResolution" && it.parameterTypes.size == 2
+                }
+                if (m != null) {
+                    m.invoke(c, best.width, best.height)
+                } else {
+                    diag("This engine build can't switch resolution", true)
+                }
+            } catch (t: Throwable) {
+                Log.w("CameraBridge", "updateResolution failed", t)
+            }
+        }, 400)
+    }
+
+    // ---- Stream pause/resume around control writes -------------------------
+    //
+    // Round-8 field data: this camera NEVER answers EP0 control requests
+    // while its isochronous stream is running — a libuvc write sat >15 s in
+    // silence, and direct usbfs transfers STALL instantly. No timeout value
+    // fixes that; the only reliable way to deliver a control write to this
+    // firmware is to quiesce the stream first. stopPreview() halts the
+    // isoch engine (EP0 becomes responsive in milliseconds), the queued
+    // writes are applied, then startPreview() resumes — a ~0.3-0.8 s frozen
+    // frame on the PC instead of a wedged thread + full USB reset.
+    //
+    // CRITICAL detail from the AUSBC source: UVCCamera.stopPreview() also
+    // calls setFrameCallback(null, 0) — it CLEARS the native frame
+    // callback. Resume must re-register CameraUVC's private frameCallBack
+    // or NV21 frames (and with them the whole PC stream) silently die.
+    @Volatile private var streamPaused = false
+
+    /** Halt the isoch stream so EP0 control writes can get through. */
+    fun ctlPauseStream(): Boolean {
+        if (streamPaused) return true
+        return try {
+            val cam = getCurrentCamera() as? com.jiangdg.ausbc.camera.CameraUVC
+                ?: return false
+            val uvc = getUvcCamera(cam) ?: return false
+            val m = uvc.javaClass.getMethod("stopPreview")
+            m.invoke(uvc)
+            streamPaused = true
+            true
+        } catch (t: Throwable) {
+            Log.w("CameraBridge", "ctlPauseStream failed", t)
+            false
+        }
+    }
+
+    /** Restart the stream and re-register the raw frame callback. */
+    fun ctlResumeStream() {
+        if (!streamPaused) return
+        streamPaused = false
+        try {
+            val cam = getCurrentCamera() as? com.jiangdg.ausbc.camera.CameraUVC
+                ?: return
+            val uvc = getUvcCamera(cam) ?: return
+            uvc.javaClass.getMethod("startPreview").invoke(uvc)
+            // stopPreview() did setFrameCallback(null, 0) natively — put
+            // CameraUVC's own callback back, or the PC stream never
+            // resumes. 4 == UVCCamera.PIXEL_FORMAT_YUV420SP, the constant
+            // CameraUVC registers with at open.
+            try {
+                val cb = readDeclaredField(cam, "frameCallBack")
+                if (cb != null) {
+                    val m = uvc.javaClass.methods.firstOrNull {
+                        it.name == "setFrameCallback" && it.parameterTypes.size == 2
+                    }
+                    m?.invoke(uvc, cb, 4)
+                }
+            } catch (t: Throwable) {
+                Log.w("CameraBridge", "frame callback re-register failed", t)
+            }
+        } catch (t: Throwable) {
+            Log.w("CameraBridge", "ctlResumeStream failed", t)
+        }
+    }
+
     private val reqWidth = 1920
     private val reqHeight = 1080
 
@@ -247,7 +398,10 @@ class CameraBridgeFragment : CameraFragment() {
                     )
                     diag("Scanner connected \u2014 controls ready")
                 }
-                resolveActualPreviewSize()
+                streamPaused = false
+                readNegotiatedSize()
+                diag("Video: ${frameW}\u00d7${frameH}", err = false, force = true)
+                maybeUpgradeResolution()
                 frameBridge?.setResolution(frameW, frameH)
                 try {
                     addPreviewDataCallBack(previewCallback)
@@ -269,6 +423,7 @@ class CameraBridgeFragment : CameraFragment() {
                 wbLibSetter = null
                 direct = null
                 usbConn = null
+                streamPaused = false
                 callbacks?.onCameraClosed()
             }
             ICameraStateCallBack.State.ERROR -> {
@@ -277,6 +432,7 @@ class CameraBridgeFragment : CameraFragment() {
                 wbLibSetter = null
                 direct = null
                 usbConn = null
+                streamPaused = false
                 callbacks?.onCameraClosed()
             }
         }
