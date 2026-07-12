@@ -286,6 +286,63 @@ class CameraBridgeFragment : CameraFragment() {
     // startPreview() and the whole pipeline comes back.
     @Volatile private var resumeTexture: android.graphics.SurfaceTexture? = null
 
+    // ---- black-flash cover -------------------------------------------------
+    // Native stopPreview() calls clearDisplay() — it PAINTS the preview
+    // window black before halting the stream (UVCPreview.cpp). That's the
+    // 2 s black flash on every adjustment. We cover the render view with a
+    // snapshot of the last frame for the duration of the pause and drop the
+    // cover when the first post-resume frame actually arrives — the phone
+    // shows a frozen frame instead of black, same as the PC side.
+    private var pauseCover: android.widget.ImageView? = null
+    @Volatile private var hideCoverOnNextFrame = false
+
+    private fun showPauseCover() {
+        val done = java.util.concurrent.CountDownLatch(1)
+        mainH.post {
+            try {
+                val b = binding ?: return@post
+                val bmp = try { b.cameraRender.getBitmap() } catch (_: Throwable) { null }
+                    ?: return@post
+                val iv = pauseCover ?: android.widget.ImageView(b.root.context).also {
+                    it.scaleType = android.widget.ImageView.ScaleType.FIT_XY
+                    pauseCover = it
+                }
+                val lp = android.widget.FrameLayout.LayoutParams(
+                    b.cameraRender.width, b.cameraRender.height,
+                    android.view.Gravity.CENTER
+                )
+                if (iv.parent == null) b.cameraContainer.addView(iv, lp)
+                else iv.layoutParams = lp
+                iv.setImageBitmap(bmp)
+                iv.visibility = android.view.View.VISIBLE
+            } finally {
+                done.countDown()
+            }
+        }
+        // Block the control thread briefly so the cover is up BEFORE
+        // clearDisplay paints black underneath it.
+        try {
+            done.await(300, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+        }
+    }
+
+    private fun hidePauseCoverSoon() {
+        hideCoverOnNextFrame = true
+        // Fallback: never leave a stale cover if frames don't resume.
+        mainH.postDelayed({
+            if (hideCoverOnNextFrame) {
+                hideCoverOnNextFrame = false
+                pauseCover?.visibility = android.view.View.GONE
+            }
+        }, 1500)
+    }
+
+    private fun hidePauseCoverNow() {
+        hideCoverOnNextFrame = false
+        mainH.post { pauseCover?.visibility = android.view.View.GONE }
+    }
+
     /** Halt the isoch stream so EP0 control writes can get through. */
     fun ctlPauseStream(): Boolean {
         if (streamPaused) return true
@@ -303,6 +360,7 @@ class CameraBridgeFragment : CameraFragment() {
                 return false
             }
             resumeTexture = st
+            showPauseCover()
             uvc.javaClass.getMethod("stopPreview").invoke(uvc)
             // Let the firmware digest the stream-stop (it's an EP0
             // SET_INTERFACE itself) before the first control write lands —
@@ -314,6 +372,7 @@ class CameraBridgeFragment : CameraFragment() {
         } catch (t: Throwable) {
             Log.w("CameraBridge", "ctlPauseStream failed", t)
             resumeTexture = null
+            hidePauseCoverNow()
             false
         }
     }
@@ -354,6 +413,7 @@ class CameraBridgeFragment : CameraFragment() {
             Log.w("CameraBridge", "ctlResumeStream failed", t)
         } finally {
             resumeTexture = null
+            hidePauseCoverSoon()
         }
     }
 
@@ -408,6 +468,10 @@ class CameraBridgeFragment : CameraFragment() {
                     frameH = height
                     refitPreview() // real stream size differs from requested
                 }
+            }
+            if (hideCoverOnNextFrame) {
+                hideCoverOnNextFrame = false
+                mainH.post { pauseCover?.visibility = android.view.View.GONE }
             }
 
             val isNv21 = (format == IPreviewDataCallBack.DataFormat.NV21)
@@ -512,6 +576,7 @@ class CameraBridgeFragment : CameraFragment() {
             }
             ICameraStateCallBack.State.CLOSED -> {
                 camOpen = false
+                hidePauseCoverNow()
                 expInited = false
                 wbLibInited = false
                 wbLibSetter = null
@@ -522,6 +587,7 @@ class CameraBridgeFragment : CameraFragment() {
             }
             ICameraStateCallBack.State.ERROR -> {
                 camOpen = false
+                hidePauseCoverNow()
                 expInited = false
                 wbLibInited = false
                 wbLibSetter = null
@@ -587,13 +653,58 @@ class CameraBridgeFragment : CameraFragment() {
     @Volatile private var ctrlBlockClosed = false
 
     /**
+     * Re-resolve the CURRENT UsbDevice instance by vid:pid. Holding a stale
+     * instance across a reset/re-enumeration is what fed USBMonitor a device
+     * the app had no permission for — Android permissions are per
+     * device-CONNECTION, so an old object can look valid while the node it
+     * points at is a new, ungranted connection. That's the getSerialNumber
+     * SecurityException crash from the round-12 log.
+     */
+    private fun freshDevice(): android.hardware.usb.UsbDevice? {
+        val last = lastKnownDevice ?: return null
+        return try {
+            val um = context?.getSystemService(android.content.Context.USB_SERVICE)
+                as? android.hardware.usb.UsbManager ?: return last
+            um.deviceList?.values?.firstOrNull {
+                it.vendorId == last.vendorId && it.productId == last.productId
+            } ?: last
+        } catch (_: Throwable) { last }
+    }
+
+    /**
+     * Called (via UsbRescue) after AUSBC's USBMonitor thread died on the
+     * permission race. The process survives — CrashApp swallows that one
+     * crash — but the dead thread means no more attach/connect events ever.
+     * Tear the client down and register a fresh one (new USBMonitor + new
+     * thread); registration re-scans attached devices and reconnects.
+     */
+    fun rebuildCameraClient() {
+        mainH.post {
+            try {
+                unRegisterMultiCamera()
+            } catch (t: Throwable) {
+                Log.w("CameraBridge", "unRegisterMultiCamera threw", t)
+            }
+            mainH.postDelayed({
+                try {
+                    registerMultiCamera()
+                    diag("USB engine rebuilt \u2014 reconnecting\u2026", err = false, force = true)
+                } catch (t: Throwable) {
+                    Log.w("CameraBridge", "registerMultiCamera threw", t)
+                    diag("USB engine rebuild failed \u2014 replug the scanner", true)
+                }
+            }, 400)
+        }
+    }
+
+    /**
      * Last-resort reset when even the soft-recovery reopen fails: open a
      * brand-new fd straight from UsbManager (independent of AUSBC's dead
      * block) just to issue resetDevice(), then let the re-enumeration
      * attach flow rebuild everything.
      */
     fun ctlResetFromScratch(): Boolean {
-        val dev = lastKnownDevice ?: return false
+        val dev = freshDevice() ?: return false
         return try {
             val um = context?.getSystemService(android.content.Context.USB_SERVICE)
                 as? android.hardware.usb.UsbManager ?: return false
@@ -681,7 +792,7 @@ class CameraBridgeFragment : CameraFragment() {
             // (Guard is camOpen, not usbConn: usbConn stays null in library
             // mode, which let this fire on an already-open camera.)
             if (camOpen) return@Runnable
-            val dev = lastKnownDevice
+            val dev = freshDevice()
             if (blockWasDead && dev != null) {
                 // The soft abort closed AUSBC's UsbControlBlock. Reopening
                 // with the dead block just fails (round-11: permanent
