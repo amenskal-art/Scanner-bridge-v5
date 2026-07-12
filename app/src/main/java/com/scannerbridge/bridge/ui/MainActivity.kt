@@ -88,6 +88,14 @@ class MainActivity : AppCompatActivity(),
                     height = h
                 }
             }
+        } else {
+            // Exit-fullscreen rotation just completed: only NOW does
+            // previewHost have its portrait width, so only now can the
+            // host height be computed correctly. Doing this inside
+            // exitFullscreen() ran with the LANDSCAPE width still in
+            // effect and produced a wrong (too tall) box — the black
+            // borders after leaving fullscreen.
+            binding.previewHost.post { fitPortraitPreviewHost() }
         }
     }
 
@@ -330,27 +338,28 @@ class MainActivity : AppCompatActivity(),
             // a ~0.3-0.8 s frozen frame on the PC instead of a wedged
             // thread + USB reset + reconnect cascade.
             var paused = false
+            val pauseStart = System.currentTimeMillis()
             if (libMode && frag != null) {
                 paused = frag.ctlPauseStream()
-                if (paused) onControlDiag("Stream paused \u2014 applying controls\u2026", false)
             }
             try {
                 var passes = 0
                 while (true) {
                     drainOnce(paused)
                     passes++
-                    if (!paused || passes >= 6) break
+                    if (!paused || passes >= 12) break
                     if (pendingControls.isNotEmpty()) continue
-                    // Queue is empty: linger briefly so values still arriving
-                    // from an in-progress drag ride the SAME pause window
-                    // instead of forcing a second pause right after resume.
-                    try { Thread.sleep(250) } catch (_: InterruptedException) {}
+                    // Queue is empty: linger so values still arriving from an
+                    // in-progress drag ride the SAME pause window instead of
+                    // forcing pause/resume churn several times a second
+                    // (round-9 log showed 2 cycles/s during drags).
+                    try { Thread.sleep(400) } catch (_: InterruptedException) {}
                     if (pendingControls.isEmpty()) break
                 }
             } finally {
                 if (paused) {
                     frag?.ctlResumeStream()
-                    onControlDiag("Controls applied \u2014 stream resumed", false)
+                    reportPauseCycle(System.currentTimeMillis() - pauseStart)
                 }
             }
         }
@@ -417,6 +426,15 @@ class MainActivity : AppCompatActivity(),
     private val LIB_SLOW_NOTICE_MS = 5000L
     private val LIB_STALL_RESET_MS = 15000L
     @Volatile private var slowNoticeShownFor = 0L
+
+    // One pause-cycle line per 5 s max — proof of life, not spam.
+    @Volatile private var lastPauseReportAt = 0L
+    private fun reportPauseCycle(tookMs: Long) {
+        val now = System.currentTimeMillis()
+        if (now - lastPauseReportAt < 5000) return
+        lastPauseReportAt = now
+        onControlDiag("Controls applied \u2014 stream paused $tookMs ms", false)
+    }
 
     // At most one "answered slowly" info line per 10 s — it's a breadcrumb,
     // not spam.
@@ -864,7 +882,9 @@ class MainActivity : AppCompatActivity(),
         }
 
         binding.contentScroll.post { binding.contentScroll.scrollTo(0, savedScrollY) }
-        fitPortraitPreviewHost()
+        // NOTE: no fitPortraitPreviewHost() here — at this point the window
+        // still has landscape dimensions; onConfigurationChanged does the
+        // refit once the rotation back to portrait has actually happened.
     }
 
     private fun setSiblingCardsVisible(visibility: Int) {
