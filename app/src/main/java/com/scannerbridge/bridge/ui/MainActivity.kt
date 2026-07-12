@@ -209,6 +209,7 @@ class MainActivity : AppCompatActivity(),
         cameraFragment?.frameBridge = bridge
         srv.start()
         streaming = true
+        serverBindRetries = 0
 
         val url = NetworkUtils.buildStreamUrl(phoneIp, streamPort)
         try {
@@ -264,7 +265,9 @@ class MainActivity : AppCompatActivity(),
         ui.postDelayed(object : Runnable {
             override fun run() {
                 val fps = frameBridge?.fpsCounter?.fps ?: 0
-                binding.fpsBadge.text = "$fps fps"
+                binding.fpsBadge.text =
+                    if (lastVideoW > 0) "$fps fps \u00b7 ${lastVideoW}\u00d7${lastVideoH}"
+                    else "$fps fps"
                 checkControlWatchdog()
                 ui.postDelayed(this, 1000)
             }
@@ -318,40 +321,62 @@ class MainActivity : AppCompatActivity(),
                 controlHandler.postDelayed(this, quietLeft)
                 return
             }
+            if (pendingControls.isEmpty()) return
+            val frag = cameraFragment
+            val libMode = frag?.isDirectControlActive() != true
+            // Library path on THIS camera: EP0 never answers while the isoch
+            // stream is running (round-8 field log: >15 s of silence, then
+            // reset). Quiesce the stream, flush the whole queue, resume —
+            // a ~0.3-0.8 s frozen frame on the PC instead of a wedged
+            // thread + USB reset + reconnect cascade.
+            var paused = false
+            if (libMode && frag != null) {
+                paused = frag.ctlPauseStream()
+                if (paused) onControlDiag("Stream paused \u2014 applying controls\u2026", false)
+            }
+            try {
+                var passes = 0
+                while (true) {
+                    drainOnce(paused)
+                    passes++
+                    if (!paused || passes >= 6) break
+                    if (pendingControls.isNotEmpty()) continue
+                    // Queue is empty: linger briefly so values still arriving
+                    // from an in-progress drag ride the SAME pause window
+                    // instead of forcing a second pause right after resume.
+                    try { Thread.sleep(250) } catch (_: InterruptedException) {}
+                    if (pendingControls.isEmpty()) break
+                }
+            } finally {
+                if (paused) {
+                    frag?.ctlResumeStream()
+                    onControlDiag("Controls applied \u2014 stream resumed", false)
+                }
+            }
+        }
+
+        private fun drainOnce(paused: Boolean) {
             val names = ArrayList(pendingControls.keys)
             for (n in names) {
                 val v = pendingControls.remove(n) ?: continue
                 if (lastApplied[n] == v) continue // no change -> no USB traffic
-                // Arm the watchdog ONLY for libuvc writes. Direct-path writes
-                // have a real kernel-enforced timeout on every transfer and
-                // CANNOT hang forever — but a first-use sequence on a slow,
-                // loaded camera (range GETs + mode byte + SET + retry, each
-                // up to 4 s) can legitimately take well over any sane
-                // watchdog threshold. Watching those produced the round-5
-                // false reset. Only libuvc's infinite-timeout transfers can
-                // genuinely wedge, so only they are watched.
+                // Arm the watchdog ONLY for libuvc writes: they have no
+                // timeout of their own, so only they can wedge a thread.
+                // The direct path self-timeouts and is never watched.
                 val watched = cameraFragment?.isDirectControlActive() != true
                 if (watched) controlBusySince = System.currentTimeMillis()
                 val t0 = System.currentTimeMillis()
                 try {
                     applyControlToCamera(n, v)
                     lastApplied[n] = v
-                    // Field breadcrumb: this camera answers EP0 SLOWLY under
-                    // full stream + PC load (libuvc has no timeout, so the
-                    // write blocks until it answers). Report how slow, so
-                    // the on-screen log tells us the real latency instead of
-                    // the old behavior of resetting before we could see it.
                     if (watched) {
                         val took = System.currentTimeMillis() - t0
                         if (took > 2000) reportSlowLibWrite(took)
                     }
-                    // Pace EP0 writes; bursts wedge cheap firmware. The
-                    // library path gets a longer gap: its transfers have no
-                    // timeout, so the cost of provoking a firmware stall
-                    // there is a wedged thread + full USB reset, not a
-                    // dropped value. Coalescing means a drag still lands on
-                    // its final value.
-                    Thread.sleep(if (watched) 250 else 50)
+                    // With the stream paused, EP0 answers in milliseconds —
+                    // short gap. An unpaused libuvc write keeps the long
+                    // gap (bursts wedge cheap firmware).
+                    Thread.sleep(if (watched && !paused) 250 else 50)
                 } catch (_: Throwable) {
                 } finally {
                     controlBusySince = 0L
@@ -921,8 +946,22 @@ class MainActivity : AppCompatActivity(),
         // Stats displays removed
     }
 
+    @Volatile private var serverBindRetries = 0
+
     override fun onServerError(message: String) {
-        runOnUiThread { toast("Server error: $message") }
+        runOnUiThread {
+            toast("Server error: $message")
+            // "EADDRINUSE": a previous socket (duplicate activity instance
+            // launched by USB_DEVICE_ATTACHED, or a just-crashed session)
+            // hadn't released :8080. launchMode=singleTask removes the
+            // duplicate-activity cause; if it still happens, retry the bind
+            // instead of leaving the PC with no stream.
+            if (streaming && message.contains("EADDRINUSE", ignoreCase = true)
+                && serverBindRetries < 3) {
+                serverBindRetries++
+                ui.postDelayed({ if (streaming) server?.start() }, 1500)
+            }
+        }
     }
 
     override fun onDestroy() {
