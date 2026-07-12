@@ -172,13 +172,52 @@ class CameraBridgeFragment : CameraFragment() {
             ?: sizes.minByOrNull { it.width * it.height }
     }
 
+    /** One-time dump of every mode the camera advertises (both formats). */
+    @Volatile private var modesDiagShown = false
+    private fun diagCameraModes() {
+        if (modesDiagShown) return
+        modesDiagShown = true
+        try {
+            val cam = getCurrentCamera() ?: return
+            val mj = try { cam.getAllPreviewSizes() } catch (_: Throwable) { null }
+            val mjTxt = mj?.takeIf { it.isNotEmpty() }
+                ?.joinToString(", ") { "${it.width}\u00d7${it.height}" } ?: "none"
+            diag("MJPEG modes: $mjTxt", err = false, force = true)
+            // The YUYV list too (FRAME_FORMAT_YUYV == 0): if the camera
+            // hides its big modes in the other format, this shows it.
+            val uvc = (cam as? com.jiangdg.ausbc.camera.CameraUVC)
+                ?.let { getUvcCamera(it) } ?: return
+            val m = uvc.javaClass.methods.firstOrNull {
+                it.name == "getSupportedSizeList" && it.parameterTypes.size == 1
+            } ?: return
+            val yuv = m.invoke(uvc, 0) as? List<*>
+            if (!yuv.isNullOrEmpty()) {
+                val t = yuv.joinToString(", ") { s ->
+                    val w = s?.let { readDeclaredField(it, "width") } ?: "?"
+                    val h = s?.let { readDeclaredField(it, "height") } ?: "?"
+                    "$w\u00d7$h"
+                }
+                diag("YUYV modes: $t", err = false, force = true)
+            }
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun maybeUpgradeResolution() {
         if (resolutionFixTried) return
         val cam = getCurrentCamera() ?: return
         val sizes = try { cam.getAllPreviewSizes() } catch (_: Throwable) { null }
         if (sizes.isNullOrEmpty()) return
         val best = pickBestSize(sizes) ?: return
-        if (best.width * best.height <= frameW * frameH) return // already best
+        if (best.width * best.height <= frameW * frameH) {
+            // Tell the field log WHY no upgrade is coming, once.
+            resolutionFixTried = true
+            diag(
+                "${frameW}\u00d7${frameH} is the largest MJPEG mode this camera offers",
+                err = false, force = true
+            )
+            return
+        }
         resolutionFixTried = true
         diag(
             "Camera opened at ${frameW}\u00d7${frameH} \u2014 " +
@@ -222,6 +261,17 @@ class CameraBridgeFragment : CameraFragment() {
     // or NV21 frames (and with them the whole PC stream) silently die.
     @Volatile private var streamPaused = false
 
+    // GL-mode resume target, captured at pause time. Round-9 blackout root
+    // cause (verified in AUSBC native source, UVCPreview.cpp): native
+    // stopPreview() does ANativeWindow_release(mPreviewWindow) and NULLs
+    // it, and native startPreview() REFUSES to spawn its streaming thread
+    // while the window is NULL. So resume was a silent no-op — no preview
+    // thread, no frames: black phone preview AND dead PC stream. The
+    // SurfaceTexture AUSBC's GL pipeline consumes lives in
+    // RenderManager.mCameraSurfaceTexture; re-attach it BEFORE
+    // startPreview() and the whole pipeline comes back.
+    @Volatile private var resumeTexture: android.graphics.SurfaceTexture? = null
+
     /** Halt the isoch stream so EP0 control writes can get through. */
     fun ctlPauseStream(): Boolean {
         if (streamPaused) return true
@@ -229,17 +279,27 @@ class CameraBridgeFragment : CameraFragment() {
             val cam = getCurrentCamera() as? com.jiangdg.ausbc.camera.CameraUVC
                 ?: return false
             val uvc = getUvcCamera(cam) ?: return false
-            val m = uvc.javaClass.getMethod("stopPreview")
-            m.invoke(uvc)
+            // Resolve the resume surface FIRST — pausing without a way to
+            // resume would strand the stream black (the round-9 bug).
+            val rm = readDeclaredField(cam, "mRenderManager")
+            val st = rm?.let { readDeclaredField(it, "mCameraSurfaceTexture") }
+                as? android.graphics.SurfaceTexture
+            if (st == null) {
+                Log.w("CameraBridge", "no camera SurfaceTexture; not pausing")
+                return false
+            }
+            resumeTexture = st
+            uvc.javaClass.getMethod("stopPreview").invoke(uvc)
             streamPaused = true
             true
         } catch (t: Throwable) {
             Log.w("CameraBridge", "ctlPauseStream failed", t)
+            resumeTexture = null
             false
         }
     }
 
-    /** Restart the stream and re-register the raw frame callback. */
+    /** Re-attach the render surface, restart the stream, restore callback. */
     fun ctlResumeStream() {
         if (!streamPaused) return
         streamPaused = false
@@ -247,11 +307,19 @@ class CameraBridgeFragment : CameraFragment() {
             val cam = getCurrentCamera() as? com.jiangdg.ausbc.camera.CameraUVC
                 ?: return
             val uvc = getUvcCamera(cam) ?: return
+            // 1. Re-attach the render surface stopPreview() released —
+            //    without this startPreview() won't even start its thread.
+            resumeTexture?.let { st ->
+                val m = uvc.javaClass.methods.firstOrNull {
+                    it.name == "setPreviewTexture" && it.parameterTypes.size == 1
+                }
+                m?.invoke(uvc, st)
+            }
+            // 2. Restart the isoch stream.
             uvc.javaClass.getMethod("startPreview").invoke(uvc)
-            // stopPreview() did setFrameCallback(null, 0) natively — put
-            // CameraUVC's own callback back, or the PC stream never
-            // resumes. 4 == UVCCamera.PIXEL_FORMAT_YUV420SP, the constant
-            // CameraUVC registers with at open.
+            // 3. Put the raw frame callback back (stopPreview cleared it
+            //    natively: setFrameCallback(null, 0)). Without this the PC
+            //    stream never resumes. 4 == UVCCamera.PIXEL_FORMAT_YUV420SP.
             try {
                 val cb = readDeclaredField(cam, "frameCallBack")
                 if (cb != null) {
@@ -265,6 +333,8 @@ class CameraBridgeFragment : CameraFragment() {
             }
         } catch (t: Throwable) {
             Log.w("CameraBridge", "ctlResumeStream failed", t)
+        } finally {
+            resumeTexture = null
         }
     }
 
@@ -401,6 +471,7 @@ class CameraBridgeFragment : CameraFragment() {
                 streamPaused = false
                 readNegotiatedSize()
                 diag("Video: ${frameW}\u00d7${frameH}", err = false, force = true)
+                diagCameraModes()
                 maybeUpgradeResolution()
                 frameBridge?.setResolution(frameW, frameH)
                 try {
