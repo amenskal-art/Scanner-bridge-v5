@@ -17,6 +17,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.scannerbridge.bridge.CrashApp
+import com.scannerbridge.bridge.UsbRescue
 import com.scannerbridge.bridge.R
 import com.scannerbridge.bridge.databinding.ActivityMainBinding
 import com.scannerbridge.bridge.server.FrameBridge
@@ -67,6 +68,19 @@ class MainActivity : AppCompatActivity(),
         binding.stopButton.setOnClickListener { stopEverything() }
         setupCameraControls()
         setupFullscreen()
+
+        // Rescue hook: CrashApp swallows AUSBC's USBMonitor permission-race
+        // crash (round-12 log) instead of killing the app; we rebuild the
+        // camera client here — fresh USBMonitor thread, reconnect.
+        UsbRescue.onUsbMonitorCrash = {
+            runOnUiThread {
+                onControlDiag(
+                    "USB engine crashed (permission race) \u2014 rebuilding\u2026",
+                    true
+                )
+                cameraFragment?.rebuildCameraClient()
+            }
+        }
 
         val lastCrash = CrashApp.readAndClear(application)
         if (lastCrash != null) {
@@ -330,6 +344,12 @@ class MainActivity : AppCompatActivity(),
                 return
             }
             if (pendingControls.isEmpty()) return
+            // Drop no-op values BEFORE deciding to pause: a slider dragged
+            // back to its applied value must not cost a stream blip.
+            for (k in ArrayList(pendingControls.keys)) {
+                if (lastApplied[k] == pendingControls[k]) pendingControls.remove(k)
+            }
+            if (pendingControls.isEmpty()) return
             val frag = cameraFragment
             val libMode = frag?.isDirectControlActive() != true
             // Library path on THIS camera: EP0 never answers while the isoch
@@ -354,7 +374,7 @@ class MainActivity : AppCompatActivity(),
                     // in-progress drag ride the SAME pause window instead of
                     // forcing pause/resume churn several times a second
                     // (round-9 log showed 2 cycles/s during drags).
-                    try { Thread.sleep(400) } catch (_: InterruptedException) {}
+                    try { Thread.sleep(250) } catch (_: InterruptedException) {}
                     if (pendingControls.isEmpty()) break
                 }
             } finally {
@@ -1096,6 +1116,7 @@ class MainActivity : AppCompatActivity(),
     }
 
     override fun onDestroy() {
+        UsbRescue.onUsbMonitorCrash = null
         if (streaming || scanning) stopEverything()
         try {
             controlThread.quitSafely()
