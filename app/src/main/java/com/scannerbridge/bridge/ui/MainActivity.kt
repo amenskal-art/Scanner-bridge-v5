@@ -370,6 +370,15 @@ class MainActivity : AppCompatActivity(),
             val names = ArrayList(pendingControls.keys)
             for (n in names) {
                 val v = pendingControls.remove(n) ?: continue
+                if (n in deadControls) {
+                    if (deadControlWarned.add(n)) {
+                        onControlDiag(
+                            "'$n' is disabled \u2014 this scanner's firmware wedges on it",
+                            true
+                        )
+                    }
+                    continue
+                }
                 if (lastApplied[n] == v) continue // no change -> no USB traffic
                 // Arm the watchdog ONLY for libuvc writes: they have no
                 // timeout of their own, so only they can wedge a thread.
@@ -456,6 +465,14 @@ class MainActivity : AppCompatActivity(),
     // Last time the SOFT recovery ran; a second wedge within 90 s escalates
     // to the full USB reset.
     @Volatile private var lastSoftRecoveryAt = 0L
+    // Controls THIS camera wedges on — never sent again. Learned at runtime
+    // (round-11: "exposure"), persisted per device by the fragment, loaded
+    // on every open. One wedge costs one recovery; after that the control
+    // is simply skipped with an explanatory diag/toast.
+    private val deadControls: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
+    private val deadControlWarned: MutableSet<String> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap())
 
     // One pause-cycle line per 5 s max — proof of life, not spam.
     @Volatile private var lastPauseReportAt = 0L
@@ -513,6 +530,14 @@ class MainActivity : AppCompatActivity(),
                 "Control write ($stuckName) wedged again \u2014 forcing full USB reset",
             true
         )
+        // Quarantine the culprit: one wedge per control per camera, ever.
+        if (stuckName.isNotEmpty() && deadControls.add(stuckName)) {
+            cameraFragment?.persistQuarantine(stuckName)
+            onControlDiag(
+                "'$stuckName' disabled for this scanner \u2014 firmware wedges on it",
+                true
+            )
+        }
 
         try { controlThread.quitSafely() } catch (_: Throwable) {}
         controlThread = android.os.HandlerThread("ScannerControlThread-r").apply { start() }
@@ -542,6 +567,29 @@ class MainActivity : AppCompatActivity(),
             } catch (t: Throwable) {
                 android.util.Log.w("MainActivity", "recovery sequence threw", t)
             }
+        }
+
+        if (soft) {
+            // Round-11 failure mode: the soft route didn't reconnect and the
+            // app sat at "No scanner" forever. If the camera isn't back in
+            // 12 s, escalate to a from-scratch USB reset automatically.
+            ui.postDelayed({
+                if (!cameraReady) {
+                    onControlDiag(
+                        "Soft restart didn't reconnect \u2014 forcing full USB reset\u2026",
+                        true
+                    )
+                    thread(name = "ScannerRecovery2") {
+                        try {
+                            cameraFragment?.ctlResetFromScratch()
+                            try { Thread.sleep(500) } catch (_: InterruptedException) {}
+                            cameraFragment?.ctlRecoverCamera()
+                        } catch (t: Throwable) {
+                            android.util.Log.w("MainActivity", "escalated recovery threw", t)
+                        }
+                    }
+                }
+            }, 12000)
         }
 
         // Allow another recovery attempt after things settle.
@@ -987,6 +1035,18 @@ class MainActivity : AppCompatActivity(),
         controlQuietMs =
             if (cameraOpenedAt - lastRecoveryAt < 30000) CONTROL_QUIET_AFTER_RESET_MS
             else CONTROL_QUIET_MS
+        deadControls.clear()
+        deadControlWarned.clear()
+        cameraFragment?.loadQuarantine()?.let { q ->
+            deadControls.addAll(q)
+            if (q.isNotEmpty()) {
+                onControlDiag(
+                    "Disabled for this scanner (wedges firmware): " +
+                        q.joinToString(", "),
+                    false
+                )
+            }
+        }
         lastVideoW = width
         lastVideoH = height
         val gen = ++openGeneration
