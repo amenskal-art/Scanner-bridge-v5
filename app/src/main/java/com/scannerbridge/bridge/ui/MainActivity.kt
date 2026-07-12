@@ -342,6 +342,7 @@ class MainActivity : AppCompatActivity(),
             if (libMode && frag != null) {
                 paused = frag.ctlPauseStream()
             }
+            pausePhase = paused
             try {
                 var passes = 0
                 while (true) {
@@ -357,6 +358,7 @@ class MainActivity : AppCompatActivity(),
                     if (pendingControls.isEmpty()) break
                 }
             } finally {
+                pausePhase = false
                 if (paused) {
                     frag?.ctlResumeStream()
                     reportPauseCycle(System.currentTimeMillis() - pauseStart)
@@ -373,6 +375,7 @@ class MainActivity : AppCompatActivity(),
                 // timeout of their own, so only they can wedge a thread.
                 // The direct path self-timeouts and is never watched.
                 val watched = cameraFragment?.isDirectControlActive() != true
+                controlBusyName = n
                 if (watched) controlBusySince = System.currentTimeMillis()
                 val t0 = System.currentTimeMillis()
                 try {
@@ -380,7 +383,7 @@ class MainActivity : AppCompatActivity(),
                     lastApplied[n] = v
                     if (watched) {
                         val took = System.currentTimeMillis() - t0
-                        if (took > 2000) reportSlowLibWrite(took)
+                        if (took > 2000) reportSlowLibWrite(n, took)
                     }
                     // With the stream paused, EP0 answers in milliseconds —
                     // short gap. An unpaused libuvc write keeps the long
@@ -394,13 +397,30 @@ class MainActivity : AppCompatActivity(),
         }
     }
 
+    // When the first value of a burst arrived — lets a very long drag get
+    // one mid-drag flush instead of waiting forever for the settle window.
+    @Volatile private var firstPendingAt = 0L
+
     private fun enqueueControl(name: String, value: Int) {
+        if (pendingControls.isEmpty()) firstPendingAt = System.currentTimeMillis()
         pendingControls[name] = value
         controlHandler.removeCallbacks(writePendingControlsRunnable)
-        // Debounce & throttle writes sequentially. 100 ms (was 30) — during a
-        // slider drag only the newest value per control survives, cutting
-        // control-endpoint traffic to <=10 writes/sec per control.
-        controlHandler.postDelayed(writePendingControlsRunnable, 100)
+        // DIRECT path: 100 ms debounce, values apply live during a drag.
+        // LIBRARY path (this camera): every application requires a stream
+        // pause cycle, and round-10 showed cycles firing 2x/second during a
+        // drag — visible stutter AND stop/start churn on EP0 (each resume is
+        // a full PROBE/COMMIT negotiation) that eventually wedged the
+        // firmware. So library writes now SETTLE: the flush fires 700 ms
+        // after the LAST change — one pause cycle per adjustment session,
+        // after you let go. A >2.5 s continuous drag gets one mid-drag flush
+        // so a held slider is never a black hole.
+        val direct = cameraFragment?.isDirectControlActive() == true
+        val delay = when {
+            direct -> 100L
+            System.currentTimeMillis() - firstPendingAt > 2500 -> 0L
+            else -> 700L
+        }
+        controlHandler.postDelayed(writePendingControlsRunnable, delay)
     }
 
     // Two-stage library-path watchdog.
@@ -424,8 +444,18 @@ class MainActivity : AppCompatActivity(),
     //               wedged thread, close the fd to abort the transfer,
     //               real USB port reset, reopen.
     private val LIB_SLOW_NOTICE_MS = 5000L
-    private val LIB_STALL_RESET_MS = 15000L
+    private val LIB_STALL_RESET_MS = 15000L   // unpaused libuvc writes
+    private val LIB_STALL_PAUSED_MS = 6000L   // paused writes answer in ms
     @Volatile private var slowNoticeShownFor = 0L
+    // True while the writer holds a stream-pause window. A write that sits
+    // >6 s with the isoch stream STOPPED is genuinely wedged — no reason to
+    // give it the 15 s an under-load write gets.
+    @Volatile private var pausePhase = false
+    // Which control the in-flight write is for (watchdog forensics).
+    @Volatile private var controlBusyName = ""
+    // Last time the SOFT recovery ran; a second wedge within 90 s escalates
+    // to the full USB reset.
+    @Volatile private var lastSoftRecoveryAt = 0L
 
     // One pause-cycle line per 5 s max — proof of life, not spam.
     @Volatile private var lastPauseReportAt = 0L
@@ -439,12 +469,12 @@ class MainActivity : AppCompatActivity(),
     // At most one "answered slowly" info line per 10 s — it's a breadcrumb,
     // not spam.
     @Volatile private var lastSlowReportAt = 0L
-    private fun reportSlowLibWrite(tookMs: Long) {
+    private fun reportSlowLibWrite(name: String, tookMs: Long) {
         val now = System.currentTimeMillis()
         if (now - lastSlowReportAt < 10000) return
         lastSlowReportAt = now
         val secs = String.format(java.util.Locale.US, "%.1f", tookMs / 1000.0)
-        onControlDiag("Control applied \u2014 scanner answered in $secs s (slow under stream load)", false)
+        onControlDiag("Control $name applied \u2014 answered in $secs s", false)
     }
 
     private fun checkControlWatchdog() {
@@ -456,13 +486,33 @@ class MainActivity : AppCompatActivity(),
             onControlDiag(
                 "Scanner answering slowly \u2014 waiting (stream unaffected)\u2026", false)
         }
-        if (stuckMs < LIB_STALL_RESET_MS) return
+        val limit = if (pausePhase) LIB_STALL_PAUSED_MS else LIB_STALL_RESET_MS
+        if (stuckMs < limit) return
 
         recovering = true
         lastRecoveryAt = System.currentTimeMillis()
         controlBusySince = 0L
-        toast("Scanner controls stalled — resetting…")
-        onControlDiag("Control write stalled >${LIB_STALL_RESET_MS / 1000} s \u2014 forcing scanner reset", true)
+        val stuckName = controlBusyName
+        // TWO-TIER RECOVERY (round-10: the full USB reset re-enumerated the
+        // device and cost THREE MINUTES of downtime). Tier 1 — soft: close
+        // the camera engine's own fd. That aborts the wedged transfer (the
+        // kernel fails the URB), releases the UVCCamera monitor, and the
+        // device STAYS enumerated, so recovery is an ordinary close/reopen:
+        // seconds. Tier 2 — a second wedge within 90 s means the firmware
+        // itself is stuck: full port reset, as before.
+        val soft = System.currentTimeMillis() - lastSoftRecoveryAt > 90000
+        if (soft) lastSoftRecoveryAt = System.currentTimeMillis()
+        toast(
+            if (soft) "Scanner control wedged — quick restart…"
+            else "Scanner controls stalled — resetting…"
+        )
+        onControlDiag(
+            if (soft)
+                "Control write ($stuckName) wedged \u2014 soft camera restart, no USB reset\u2026"
+            else
+                "Control write ($stuckName) wedged again \u2014 forcing full USB reset",
+            true
+        )
 
         try { controlThread.quitSafely() } catch (_: Throwable) {}
         controlThread = android.os.HandlerThread("ScannerControlThread-r").apply { start() }
@@ -470,7 +520,7 @@ class MainActivity : AppCompatActivity(),
         pendingControls.clear()
         lastApplied.clear()
 
-        // Order matters: closing the raw USB fd aborts the control transfer
+        // Order matters: closing the USB fd aborts the control transfer
         // wedged inside libuvc (its timeout is infinite) and releases the
         // UVCCamera monitor the wedged thread holds. Only AFTER that can
         // closeCamera()/openCamera() actually run — calling them first just
@@ -483,7 +533,8 @@ class MainActivity : AppCompatActivity(),
         // stream (separate threads) kept running. On a worker it's harmless.
         thread(name = "ScannerRecovery") {
             try {
-                cameraFragment?.ctlAbortStuckControl()
+                if (soft) cameraFragment?.ctlSoftAbortStuckControl()
+                else cameraFragment?.ctlAbortStuckControl()
                 // Give the aborted transfer a beat to unwind out of JNI and
                 // release the monitor before we try to take it.
                 try { Thread.sleep(300) } catch (_: InterruptedException) {}
