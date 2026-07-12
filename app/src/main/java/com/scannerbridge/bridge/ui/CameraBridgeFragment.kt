@@ -290,6 +290,11 @@ class CameraBridgeFragment : CameraFragment() {
             }
             resumeTexture = st
             uvc.javaClass.getMethod("stopPreview").invoke(uvc)
+            // Let the firmware digest the stream-stop (it's an EP0
+            // SET_INTERFACE itself) before the first control write lands —
+            // writing into a half-completed stop is a plausible trigger for
+            // the round-10 wedge-while-paused.
+            try { Thread.sleep(120) } catch (_: InterruptedException) {}
             streamPaused = true
             true
         } catch (t: Throwable) {
@@ -521,6 +526,36 @@ class CameraBridgeFragment : CameraFragment() {
      * it needs the very monitor the wedged thread holds. After this, the
      * monitor is released, close/reopen can actually run.
      */
+    /**
+     * TIER-1 abort: kill the wedged control transfer WITHOUT a USB port
+     * reset. mCtrlBlock is AUSBC's UsbControlBlock — closing it closes the
+     * UsbDeviceConnection libusb is running on, so the kernel fails the
+     * in-flight URB, libuvc's infinite-timeout call returns with an error,
+     * and the UVCCamera monitor is released. The device stays ENUMERATED:
+     * recovery is a plain closeCamera()/openCamera(), seconds — not the
+     * re-enumeration cascade a port reset triggers (3 minutes of downtime
+     * in the round-10 field log).
+     */
+    fun ctlSoftAbortStuckControl() {
+        try {
+            val cam = getCurrentCamera()
+            val cb = cam?.let { readDeclaredField(it, "mCtrlBlock") }
+            val m = cb?.javaClass?.methods?.firstOrNull {
+                it.name == "close" && it.parameterTypes.isEmpty()
+            }
+            m?.invoke(cb)
+            Log.w("CameraBridge", "soft abort: camera ctrl block closed")
+        } catch (t: Throwable) {
+            Log.w("CameraBridge", "soft abort failed", t)
+        }
+        // Our own direct-path fd too (same device), if it exists.
+        try { usbConn?.close() } catch (_: Throwable) {}
+        usbConn = null
+        direct = null
+        deviceWasReset = false
+        diag("Stuck control aborted \u2014 restarting camera engine\u2026", true)
+    }
+
     fun ctlAbortStuckControl() {
         val conn = usbConn
         usbConn = null
