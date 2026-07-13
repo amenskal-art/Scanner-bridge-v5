@@ -269,6 +269,31 @@ class CameraBridgeFragment : CameraFragment() {
     // which can yield "unknown" on one side (block/check) and the real
     // vid:pid on the other, so the entries never matched.
     @Volatile private var lastKnownDevice: android.hardware.usb.UsbDevice? = null
+
+    /**
+     * lastKnownDevice can be STALE after a USB reset: the device
+     * re-enumerates and the framework hands out a NEW UsbDevice object for
+     * the same VID/PID (often even at the same /dev/bus/usb path).
+     * Permission grants die with the OLD instance, so feeding the stale
+     * object to requestPermission() lets AUSBC's hasPermission() see a
+     * grant that is void by the time its posted processConnect() calls
+     * getSerialNumber() — SecurityException on the USBMonitor thread (the
+     * round-12 crash). Always hand the monitor the CURRENT instance from
+     * UsbManager.deviceList, matched by VID/PID; fall back to the stale
+     * one only if the device isn't enumerated at all right now.
+     */
+    private fun resolveLiveDevice(): android.hardware.usb.UsbDevice? {
+        val last = lastKnownDevice ?: return null
+        return try {
+            val um = context?.getSystemService(android.content.Context.USB_SERVICE)
+                as? android.hardware.usb.UsbManager ?: return last
+            um.deviceList?.values?.firstOrNull {
+                it.vendorId == last.vendorId && it.productId == last.productId
+            } ?: last
+        } catch (_: Throwable) {
+            last
+        }
+    }
     // True between OPENED and CLOSED/ERROR — the reliable "camera is back"
     // signal for reopen guards. The old guard checked usbConn != null, but
     // usbConn is only set when the DIRECT path initializes; in library mode
@@ -593,7 +618,7 @@ class CameraBridgeFragment : CameraFragment() {
      * attach flow rebuild everything.
      */
     fun ctlResetFromScratch(): Boolean {
-        val dev = lastKnownDevice ?: return false
+        val dev = resolveLiveDevice() ?: return false
         return try {
             val um = context?.getSystemService(android.content.Context.USB_SERVICE)
                 as? android.hardware.usb.UsbManager ?: return false
@@ -681,7 +706,12 @@ class CameraBridgeFragment : CameraFragment() {
             // (Guard is camOpen, not usbConn: usbConn stays null in library
             // mode, which let this fire on an already-open camera.)
             if (camOpen) return@Runnable
-            val dev = lastKnownDevice
+            // resolveLiveDevice, NOT lastKnownDevice: after a USB reset the
+            // stale object's permission grant is void, and requestPermission
+            // with it drove AUSBC's monitor into the round-12
+            // SecurityException (hasPermission true on the stale instance,
+            // getSerialNumber denied on the live one).
+            val dev = resolveLiveDevice()
             if (blockWasDead && dev != null) {
                 // The soft abort closed AUSBC's UsbControlBlock. Reopening
                 // with the dead block just fails (round-11: permanent
@@ -1244,3 +1274,6 @@ class CameraBridgeFragment : CameraFragment() {
         } catch (_: Throwable) {}
     }
 }
+
+
+------------------------------------------------------------
