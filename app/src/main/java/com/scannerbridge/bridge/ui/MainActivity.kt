@@ -73,6 +73,13 @@ class MainActivity : AppCompatActivity(),
             showCrashDialog(lastCrash)
         }
 
+        // A SecurityException inside AUSBC's USBMonitor (permission grant
+        // voided between hasPermission() and the posted processConnect —
+        // see CrashApp) is swallowed there instead of killing the app, but
+        // it leaves the library's monitor thread dead. This hook rebuilds
+        // the camera engine when that happens.
+        CrashApp.usbCrashHook = { onUsbMonitorCrashed() }
+
         requestRuntimePermissions()
         startStatsTicker()
         updateUi()
@@ -136,6 +143,11 @@ class MainActivity : AppCompatActivity(),
             try {
                 val frag = CameraBridgeFragment.newInstance().apply {
                     callbacks = this@MainActivity
+                    // Re-wire the frame sink too: when the fragment is
+                    // rebuilt MID-STREAM (USBMonitor crash recovery), the
+                    // MJPEG server keeps running and the new camera engine
+                    // must resume feeding it. Null when not streaming.
+                    frameBridge = this@MainActivity.frameBridge
                 }
                 cameraFragment = frag
                 supportFragmentManager.beginTransaction()
@@ -148,6 +160,55 @@ class MainActivity : AppCompatActivity(),
                 toast("Scanner init failed")
             }
         }
+    }
+
+    // ---------------- USBMonitor crash recovery ----------------
+    // Debounce: USB attach/permission broadcasts can re-trigger the same
+    // race while the rebuild is still in flight; one rebuild per 4 s max.
+    private var lastUsbRebuildAt = 0L
+
+    /**
+     * Called (on the main thread) by CrashApp after it swallowed a
+     * SecurityException from AUSBC's USBMonitor. That monitor's
+     * HandlerThread died with the exception, so the current fragment's
+     * whole camera client is inert: nothing it posts will ever run. The
+     * only clean recovery is a NEW fragment instance — AUSBC's
+     * CameraFragment base builds a fresh MultiCameraClient (and with it a
+     * fresh USBMonitor + live HandlerThread) for each instance.
+     */
+    private fun onUsbMonitorCrashed() {
+        val now = System.currentTimeMillis()
+        if (now - lastUsbRebuildAt < 4000) return
+        lastUsbRebuildAt = now
+
+        onControlDiag(
+            "USB permission race caught \u2014 restarting scanner engine\u2026",
+            true
+        )
+
+        val old = cameraFragment
+        cameraFragment = null
+        cameraReady = false
+        if (old != null) {
+            old.callbacks = null
+            old.frameBridge = null
+            try {
+                supportFragmentManager.beginTransaction()
+                    .remove(old)
+                    .commitAllowingStateLoss()
+            } catch (_: Throwable) {
+            }
+        }
+        updateUi()
+
+        // Give the system USB service a beat to finish the detach/attach
+        // that voided the grant (that's what raced the monitor in the
+        // first place), then bring up the fresh engine. If the grant is
+        // really gone, the new monitor shows the permission dialog instead
+        // of crashing.
+        ui.postDelayed({
+            if (!isFinishing && !isDestroyed) attachCameraFragment()
+        }, 1200)
     }
 
     // ---------------- scan control ----------------
@@ -1096,6 +1157,7 @@ class MainActivity : AppCompatActivity(),
     }
 
     override fun onDestroy() {
+        CrashApp.usbCrashHook = null
         if (streaming || scanning) stopEverything()
         try {
             controlThread.quitSafely()
@@ -1105,3 +1167,6 @@ class MainActivity : AppCompatActivity(),
         super.onDestroy()
     }
 }
+
+
+------------------------------------------------------------
