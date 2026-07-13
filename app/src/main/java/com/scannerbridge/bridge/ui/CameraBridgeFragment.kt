@@ -1274,6 +1274,3 @@ class CameraBridgeFragment : CameraFragment() {
         } catch (_: Throwable) {}
     }
 }
-
-
-------------------------------------------------------------
